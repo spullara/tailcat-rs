@@ -355,6 +355,8 @@ struct Actor {
     start: Instant,
     last_timers: Instant,
     last_advertise: Instant,
+    #[cfg(test)]
+    last_diagnostic: Instant,
     pings: Vec<PendingPing>,
     // Transactions bind a direct-path candidate to an authenticated pong.
     probes: HashMap<[u8; 12], ([u8; 32], SocketAddr, Instant)>,
@@ -386,6 +388,24 @@ impl Actor {
         let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let port = udp.local_addr()?.port();
         let udp6 = bind_udp6(port).ok().map(Arc::new);
+        #[cfg(test)]
+        if std::env::var_os("TAILCAT_TCP_TRACE").is_some() {
+            for socket in std::iter::once(&udp).chain(udp6.iter()) {
+                let socket = socket2::SockRef::from(socket.as_ref());
+                if let Ok(size) = std::env::var("TAILCAT_TEST_UDP_BUFFER")
+                    .unwrap_or_default()
+                    .parse::<usize>()
+                {
+                    socket.set_recv_buffer_size(size).unwrap();
+                }
+                eprintln!(
+                    "UDP server={} recv_buffer={:?} send_buffer={:?}",
+                    config.is_some(),
+                    socket.recv_buffer_size(),
+                    socket.send_buffer_size()
+                );
+            }
+        }
         let mut endpoints = Vec::new();
         if let Ok(interfaces) = if_addrs::get_if_addrs() {
             for iface in interfaces {
@@ -437,6 +457,8 @@ impl Actor {
             start: Instant::now(),
             last_timers: Instant::now(),
             last_advertise: Instant::now() - Duration::from_secs(60),
+            #[cfg(test)]
+            last_diagnostic: Instant::now(),
             pings: vec![],
             probes: HashMap::new(),
             drains: vec![],
@@ -779,6 +801,11 @@ impl Actor {
         self.device.incoming.push_back(packet);
     }
     async fn send_packet(&self, key: [u8; 32], packet: Vec<u8>) {
+        #[cfg(test)]
+        if std::env::var("TAILCAT_TEST_RELAY_ONLY").as_deref() == Ok("true") {
+            let _ = self.relay.outgoing.try_send((key, packet));
+            return;
+        }
         if let Some((endpoint, when)) = self.peers.get(&key).and_then(|p| p.direct)
             && when.elapsed() < Duration::from_secs(15)
             && self.send_udp(&packet, endpoint).await.is_ok()
@@ -790,6 +817,31 @@ impl Actor {
         let _ = self.relay.outgoing.try_send((key, packet));
     }
     async fn tick(&mut self) {
+        #[cfg(test)]
+        if std::env::var_os("TAILCAT_TCP_TRACE").is_some()
+            && self.last_diagnostic.elapsed() >= Duration::from_secs(1)
+        {
+            self.last_diagnostic = Instant::now();
+            let links = self
+                .links
+                .iter()
+                .map(|link| {
+                    let tcp = self.sockets.get::<tcp::Socket>(link.socket);
+                    (
+                        tcp.state(),
+                        tcp.send_queue(),
+                        tcp.recv_queue(),
+                        link.write_closed,
+                        link.read_closed,
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "TCP server={} links(state,send,recv,write_closed,read_closed)={links:?} direct={:?}",
+                self.config.is_some(),
+                self.peers.values().map(|p| p.direct).collect::<Vec<_>>()
+            );
+        }
         let now = SmolInstant::from_millis(self.start.elapsed().as_millis() as i64);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.poll_links();
@@ -1571,6 +1623,7 @@ mod tests {
                                 stream.read_to_end(&mut request).await.unwrap();
                                 stream.write_all(&request).await.unwrap();
                                 stream.shutdown().await.unwrap();
+                                eprintln!("stage: write shutdown");
                             })
                                 as Pin<Box<dyn Future<Output = ()> + Send>>
                         }) as TcpHandler
@@ -1583,12 +1636,18 @@ mod tests {
             let client = Client::connect(&server.tailcat_addr(), None, None)
                 .await
                 .unwrap();
+            eprintln!("stage: client connected");
             let mut stream = client.dial_tcp_port(1234).await.unwrap();
+            eprintln!("stage: TCP dialed");
             let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+            eprintln!("stage: writing {} bytes", payload.len());
             stream.write_all(&payload).await.unwrap();
+            eprintln!("stage: write completed");
             stream.shutdown().await.unwrap();
+            eprintln!("stage: write shutdown");
             let mut reply = Vec::new();
             stream.read_to_end(&mut reply).await.unwrap();
+            eprintln!("stage: reply EOF {} bytes", reply.len());
             assert_eq!(reply, payload);
             client.drain_tcp(Duration::from_secs(3)).await.unwrap();
             let mut direct = false;
@@ -1630,6 +1689,7 @@ mod tests {
                 Box::pin(async move {
                     close.await.unwrap();
                     stream.shutdown().await.unwrap();
+                    eprintln!("stage: write shutdown");
                     read.await.unwrap();
                     let mut data = Vec::new();
                     stream.read_to_end(&mut data).await.unwrap();
@@ -1646,17 +1706,27 @@ mod tests {
             let client = Client::connect(&server.tailcat_addr(), None, None)
                 .await
                 .unwrap();
+            eprintln!("stage: client connected");
             let mut stream = client.dial_tcp_port(1234).await.unwrap();
+            eprintln!("stage: TCP dialed");
             // More than one application buffer, so unread bytes remain in the
             // TCP receive queue until after its close handshake completes.
             let payload = vec![37; BUFFER_SIZE + BUFFER_SIZE / 2];
+            eprintln!("stage: writing {} bytes", payload.len());
             stream.write_all(&payload).await.unwrap();
+            eprintln!("stage: write completed");
             stream.shutdown().await.unwrap();
+            eprintln!("stage: write shutdown");
+            eprintln!("stage: start drain5s");
             client.drain_tcp(Duration::from_secs(5)).await.unwrap();
+            eprintln!("stage: drain5s completed");
             close_tx.send(()).unwrap();
             let mut reply = Vec::new();
             stream.read_to_end(&mut reply).await.unwrap();
+            eprintln!("stage: reply EOF {} bytes", reply.len());
+            eprintln!("stage: start drain5s");
             client.drain_tcp(Duration::from_secs(5)).await.unwrap();
+            eprintln!("stage: drain5s completed");
             read_tx.send(()).unwrap();
             let received = result_rx.await.unwrap();
             assert_eq!(received.len(), payload.len(), "received data was truncated");

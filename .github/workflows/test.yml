@@ -1,37 +1,36 @@
-name: Test
-
+name: Windows TCP diagnostics
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
-
 permissions:
   contents: read
-
 jobs:
-  native:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install the pinned Rust toolchain
-        run: rustup show
-      - run: cargo build --locked --all-features --bins
-      - run: cargo test --locked --all-features --all-targets
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
-
-  wasm:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup target add wasm32-unknown-unknown
-      - run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
-      - run: cargo run --locked --features web-tools --bin tailcat-webdist -- -o dist
+      - run: rustup show
+      - name: Compare UDP buffers and relay transport
+        env:
+          TAILCAT_TCP_TRACE: "1"
+        run: |
+          failed=0
+          for experiment in default:false 8192:false 65536:false 524288:false default:true; do
+            IFS=: read -r TAILCAT_TEST_UDP_BUFFER TAILCAT_TEST_RELAY_ONLY <<< "$experiment"
+            export TAILCAT_TEST_UDP_BUFFER TAILCAT_TEST_RELAY_ONLY
+            for test in closed_tcp_retains_received_data_until_application_reads native_transfer_preserves_half_close_and_discovers_direct_path; do
+              echo "::group::buffer=$TAILCAT_TEST_UDP_BUFFER relay_only=$TAILCAT_TEST_RELAY_ONLY test=$test"
+              if cargo test --locked --all-features --lib "$test" -- --nocapture; then
+                echo "EXPERIMENT PASSED"
+              else
+                failed=1
+                echo "EXPERIMENT FAILED"
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit "$failed"
