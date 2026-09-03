@@ -3390,7 +3390,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hickory-resolver",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "if-addrs",
  "libc",
  "portable-pty",
