@@ -155,7 +155,13 @@ pub async fn serve(dist: &Path, listen: &str, derp_map_url: &str) -> Result<()> 
 /// Compile the Rust browser module, generate JavaScript bindings, and precompress.
 /// Tool execution uses argv directly, with no shell interpolation.
 pub fn build_dist(web_dir: &Path, out: &Path) -> Result<()> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let web_dir = web_dir.canonicalize().with_context(|| {
+        format!(
+            "browser builds require a full source checkout; use --web-dir /path/to/tailcat-rs/web (cannot resolve {})",
+            web_dir.display()
+        )
+    })?;
+    let root = browser_source_root(&web_dir)?;
     let manifest = root.join("wasm/Cargo.toml");
     let mut build = std::process::Command::new("cargo");
     build
@@ -198,6 +204,19 @@ pub fn build_dist(web_dir: &Path, out: &Path) -> Result<()> {
     compress_wasm(&out.join("main.wasm"))?;
     Ok(())
 }
+
+fn browser_source_root(web_dir: &Path) -> Result<&Path> {
+    let root = web_dir
+        .parent()
+        .filter(|root| web_dir.is_dir() && root.join("wasm/Cargo.toml").is_file());
+    root.ok_or_else(|| {
+        anyhow!(
+            "browser builds require a full source checkout containing wasm/Cargo.toml; use --web-dir /path/to/tailcat-rs/web (given {})",
+            web_dir.display()
+        )
+    })
+}
+
 fn run(command: &mut std::process::Command) -> Result<()> {
     let status = command.status().with_context(|| {
         format!(
@@ -257,6 +276,29 @@ pub fn parse_options(args: impl Iterator<Item = String>) -> Result<HashMap<Strin
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn browser_source_root_uses_supplied_checkout() {
+        let checkout = tempfile::tempdir().unwrap();
+        let web = checkout.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::create_dir(checkout.path().join("wasm")).unwrap();
+        std::fs::write(checkout.path().join("wasm/Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(browser_source_root(&web).unwrap(), checkout.path());
+    }
+
+    #[test]
+    fn browser_build_requires_full_source_checkout() {
+        let checkout = tempfile::tempdir().unwrap();
+        let web = checkout.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+        let out = checkout.path().join("dist");
+        let error = build_dist(&web, &out).unwrap_err().to_string();
+        assert!(error.contains("full source checkout"));
+        assert!(error.contains("--web-dir"));
+        assert!(!out.exists());
+    }
+
     #[tokio::test]
     async fn serves_compressed_wasm_and_rejects_unknown_paths() {
         let dir = tempfile::tempdir().unwrap();

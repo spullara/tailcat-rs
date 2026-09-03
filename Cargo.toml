@@ -6,10 +6,35 @@ rust-version = "1.91"
 description = "Control-plane-free TCP over WireGuard and DERP"
 license = "BSD-3-Clause"
 repository = "https://github.com/spullara/tailcat-rs"
+homepage = "https://github.com/spullara/tailcat-rs"
+readme = "README.md"
+keywords = ["wireguard", "networking", "tcp", "tunnel", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+publish = ["crates-io"]
+include = ["src/**", "examples/**", "docs/**", "README.md", "RELEASING.md", "LICENSE", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "tailcat.png"]
+autobins = false
 default-run = "tailcat"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "tailcat"
+path = "src/bin/tailcat.rs"
+
+[[bin]]
+name = "tailcat-web"
+path = "src/bin/tailcat-web.rs"
+required-features = ["web-tools"]
+
+[[bin]]
+name = "tailcat-webdist"
+path = "src/bin/tailcat-webdist.rs"
+required-features = ["web-tools"]
+
+[features]
+default = []
+web-tools = []
 
 [dependencies]
 anyhow = "1"

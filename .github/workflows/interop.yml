@@ -32,7 +32,7 @@ jobs:
           cargo install wasm-bindgen-cli --version 0.2.127 --locked
       - name: Build Rust/Wasm browser distribution
         if: inputs.browser
-        run: cargo run --locked --bin tailcat-webdist -- -o dist
+        run: cargo run --locked --features web-tools --bin tailcat-webdist -- -o dist
       - name: Compare with the pinned external reference
         env:
           FULL_CLI: ${{ inputs.full_cli }}

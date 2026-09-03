@@ -41,6 +41,22 @@ wasm-bindgen module; there is no Go runtime or Go-to-JavaScript bootstrap.
 The web builder copies the JavaScript and HTML source and emits Rust bindings
 and compressed WASM assets.
 
+### Cargo distribution
+
+The default Cargo feature set provides the native `tailcat` CLI and library.
+`web-tools` enables the two web distribution and HTTP-serving binaries. Development builds and CI use `--all-features` to check both paths;
+plain `cargo install tailcat` selects only the CLI once the crate is published.
+The registry package excludes browser assets, the nested WASM crate, and the
+vendored browser dependency source. An installed web builder needs a full
+checkout supplied through `--web-dir`; it resolves the WASM manifest from that
+source directory instead of the build-time Cargo path.
+
+[The crate publishing workflow](../.github/workflows/publish-crate.yml) performs
+package validation without registry credentials. A version-matching tag is
+required for upload; manual runs default to a dry run. Publication uses the
+repository's `CARGO_REGISTRY_TOKEN` secret. See
+[RELEASING.md](../RELEASING.md#cratesio-setup) for setup and commands.
+
 ## Layers and data flow
 
 ```mermaid
@@ -158,9 +174,9 @@ Normal development checks need Rust, a native C toolchain, and the platform
 utilities exercised by a test (for example OpenSSH for its integration test):
 
 ```sh
-cargo test --locked --all-targets
+cargo test --locked --all-features --all-targets
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 Rust tests cover address vectors, authenticated frames, malformed inputs,

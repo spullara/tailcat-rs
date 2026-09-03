@@ -1,0 +1,67 @@
+name: Publish crate
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Validate the crate without uploading it to crates.io
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check package and release version
+        env:
+          PUBLISH: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: |
+          python3 scripts/check-crate-release.py \
+            --ref-type "$GITHUB_REF_TYPE" --ref-name "$GITHUB_REF_NAME" \
+            --publish "$PUBLISH"
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo test --locked --all-features --all-targets
+      - name: Verify the packaged crate without uploading
+        run: cargo publish --locked --package tailcat --registry crates-io --dry-run
+
+  publish:
+    needs: validate
+    if: >-
+      github.repository == 'spullara/tailcat-rs' &&
+      (github.event_name == 'push' || !inputs.dry_run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - name: Publish tailcat to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::error::Add a crates.io publishing token as the CARGO_REGISTRY_TOKEN repository secret. See RELEASING.md."
+            exit 1
+          fi
+          cargo publish --locked --package tailcat --registry crates-io

@@ -27,7 +27,7 @@ jobs:
       - run: rustup target add wasm32-unknown-unknown
       - run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
       - name: build the web demo dist
-        run: cargo run --locked --bin tailcat-webdist -- -o dist
+        run: cargo run --locked --features web-tools --bin tailcat-webdist -- -o dist
       - name: keep only the gzipped wasm
         run: rm dist/main.wasm dist/main.wasm.zst
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0

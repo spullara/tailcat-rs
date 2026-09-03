@@ -11,17 +11,17 @@ RUST_BIN := $(CURDIR)/target/debug/tailcat$(EXEEXT)
 .PHONY: build release test check interop interop-full interop-web web web-dist web-tools tidy
 
 build: ## Build the native Rust CLI and web tools
-	$(CARGO) build --locked --bins
+	$(CARGO) build --locked --all-features --bins
 
 release: ## Build optimized native Rust binaries
-	$(CARGO) build --locked --release --bins
+	$(CARGO) build --locked --release --all-features --bins
 
 test: ## Run Rust unit and integration tests
-	$(CARGO) test --locked --all-targets
+	$(CARGO) test --locked --all-features --all-targets
 
 check: ## Check formatting, compiler warnings, and lints
 	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --locked --all-targets -- -D warnings
+	$(CARGO) clippy --locked --all-features --all-targets -- -D warnings
 
 interop: build ## Compare Rust with a pinned, externally fetched Go implementation
 	$(PYTHON) scripts/check-interop.py --binary "$(RUST_BIN)"
@@ -37,10 +37,10 @@ web-tools: ## Install the Rust browser build prerequisites
 	$(CARGO) install wasm-bindgen-cli --version $(WASM_BINDGEN_VERSION) --locked
 
 web: ## Build and run the native Rust web demo server
-	$(CARGO) run --locked --bin tailcat-web
+	$(CARGO) run --locked --features web-tools --bin tailcat-web
 
 web-dist: ## Build the Rust/Wasm browser demo into dist/
-	$(CARGO) run --locked --bin tailcat-webdist -- -o dist
+	$(CARGO) run --locked --features web-tools --bin tailcat-webdist -- -o dist
 
 tidy: ## Resolve native Rust dependency lockfiles
 	$(CARGO) generate-lockfile

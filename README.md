@@ -34,23 +34,34 @@ supported version.
 ```sh
 git clone https://github.com/spullara/tailcat-rs.git
 cd tailcat-rs
-cargo build --release --locked --bins
+cargo build --release --locked --bin tailcat
 ./target/release/tailcat --help
 # Optional: install this checkout's CLI into Cargo's bin directory.
 cargo install --path . --locked --bin tailcat
 ```
 
-On Windows the executable is `target\release\tailcat.exe`. The other native
-binaries are `tailcat-web` and `tailcat-webdist`. These builds do not require Go.
-The `ssh` and `cp` client commands invoke system OpenSSH `ssh` and `scp`;
-`ls` and the built-in SSH/SFTP server are native Rust.
+On Windows the executable is `target\release\tailcat.exe`. Default builds and
+installs include only the `tailcat` CLI. The optional `web-tools` feature enables
+`tailcat-web` and `tailcat-webdist`; see [Browser build](#browser-build).
+These builds do not require Go. The `ssh` and `cp` client commands invoke system
+OpenSSH `ssh` and `scp`; `ls` and the built-in SSH/SFTP server are native Rust.
+
+After the crate has been published to crates.io, install the CLI with:
+
+```sh
+cargo install tailcat --locked
+```
+
+Until the first publication, use the source installation above. Maintainers can
+set up automatic crate publication with the
+[crates.io release instructions](RELEASING.md#cratesio-setup).
 
 ## Verify
 
 ```sh
-cargo test --locked --all-targets
+cargo test --locked --all-features --all-targets
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-features --all-targets -- -D warnings
 ```
 
 These checks use Rust and local fixtures. Optional cross-implementation tests
@@ -332,14 +343,34 @@ there is no direct UDP path in the browser.
 ```sh
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.127 --locked
-cargo run --locked --bin tailcat-webdist -- -o dist
-cargo run --locked --bin tailcat-web -- --dist dist --listen localhost:8080
+cargo run --locked --features web-tools --bin tailcat-webdist -- -o dist
+cargo run --locked --features web-tools --bin tailcat-web -- --dist dist --listen localhost:8080
 ```
 
 The WASM build also needs clang with WebAssembly support. On macOS,
 `brew install llvm` supplies it and the builder finds Homebrew clang
 automatically. Set `CC_wasm32_unknown_unknown` to select a compiler explicitly.
 The distribution builder emits bindings plus raw, gzip, and zstd WASM variants.
+
+To install the optional native web tools from this checkout:
+
+```sh
+cargo install --path . --locked --features web-tools \
+  --bin tailcat-web --bin tailcat-webdist
+```
+
+The published Cargo package contains the native code, not the browser source
+and vendored WASM dependency tree. Building a browser distribution therefore
+requires a full repository checkout even when the web tools are installed.
+From another working directory, pass its `web/` path explicitly:
+
+```sh
+tailcat-webdist --web-dir /path/to/tailcat-rs/web -o dist
+tailcat-web --dist dist --listen localhost:8080
+```
+
+The builder locates `wasm/Cargo.toml` beside that checkout's `web/` directory.
+Serving an already-built `dist/` does not require the source checkout.
 
 Run `make interop-web` for optional browser compatibility tests against the
 external Go reference; these additionally need a supported Chrome/Chromium
@@ -357,8 +388,10 @@ wire invariants, resource limits, and the verification strategy.
 
 Cargo, the Makefile, and the Nix flake build Rust. Tagged releases package the
 `tailcat` executable for Linux, macOS, and Windows and publish containers to
-`ghcr.io/spullara/tailcat-rs`. See [RELEASING.md](RELEASING.md) for the configured
-release process; no release or deployment is implied by a successful local build.
+`ghcr.io/spullara/tailcat-rs`. A separate [crate publishing workflow](.github/workflows/publish-crate.yml)
+validates the Cargo package and publishes it to crates.io on a matching version
+tag once its repository secret is configured. Manual runs default to a dry run.
+See [RELEASING.md](RELEASING.md) for setup and release commands.
 
 ## Security and provenance
 
