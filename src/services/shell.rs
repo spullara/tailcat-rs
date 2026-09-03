@@ -334,6 +334,10 @@ async fn run_pty(channel: Channel<Msg>, spec: CommandSpec, terminal: Terminal) -
     if let Some(fd) = pair.master.as_raw_fd() {
         apply_modes(fd, &terminal.modes)?;
     }
+    // SSH terminal modes describe POSIX termios settings. Non-Unix PTYs,
+    // including ConPTY, have no corresponding termios configuration API.
+    #[cfg(not(unix))]
+    drop(terminal.modes);
     let mut command = CommandBuilder::new(&spec.program);
     command.args(spec.args);
     command.cwd(spec.home);

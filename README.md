@@ -13,7 +13,7 @@ userspace; no root access, TUN device, or host route changes are required.
 This repository contains the Rust library and CLI, native SSH/SFTP services,
 a WebAssembly implementation, and browser JavaScript assets. The executable
 and Rust crate are both named **`tailcat`**; the repository is **`tailcat-rs`**.
-The initial package version is `0.1.0`.
+[Version `0.1.0`](https://crates.io/crates/tailcat/0.1.0) is available on crates.io.
 
 This is an independent port, not a Tailscale-maintained release. It was extracted
 from the Rust port in
@@ -27,9 +27,17 @@ and validation provenance.
 
 Install Rust through rustup and a native C build toolchain: Xcode Command Line
 Tools on macOS, a C compiler and linker on Linux, or Visual Studio C++ Build
-Tools on Windows. [rust-toolchain.toml](rust-toolchain.toml) pins Rust 1.97.1;
-rustup installs it automatically. The manifests declare Rust 1.91 as the minimum
-supported version.
+Tools on Windows. The manifests declare Rust 1.91 as the minimum supported
+version. Install the published CLI with:
+
+```sh
+cargo install tailcat --locked
+tailcat --help
+```
+
+To build from source, clone the repository. Its
+[rust-toolchain.toml](rust-toolchain.toml) pins Rust 1.97.1, which rustup installs
+automatically:
 
 ```sh
 git clone https://github.com/spullara/tailcat-rs.git
@@ -46,15 +54,8 @@ installs include only the `tailcat` CLI. The optional `web-tools` feature enable
 These builds do not require Go. The `ssh` and `cp` client commands invoke system
 OpenSSH `ssh` and `scp`; `ls` and the built-in SSH/SFTP server are native Rust.
 
-After the crate has been published to crates.io, install the CLI with:
-
-```sh
-cargo install tailcat --locked
-```
-
-Until the first publication, use the source installation above. Maintainers can
-set up OIDC trusted publishing after a one-time local bootstrap with the
-[crates.io release instructions](RELEASING.md#cratesio-setup).
+OIDC trusted publishing is configured for subsequent versions. Maintainers can
+follow the [crates.io release instructions](RELEASING.md#cratesio-setup).
 
 ## Verify
 
@@ -390,9 +391,11 @@ Cargo, the Makefile, and the Nix flake build Rust. Tagged releases package the
 `tailcat` executable for Linux, macOS, and Windows and publish containers to
 `ghcr.io/spullara/tailcat-rs`. A separate [crate publishing workflow](.github/workflows/publish-crate.yml)
 validates the Cargo package and uses GitHub OIDC trusted publishing for matching
-version tags. The first `0.1.0` upload requires a local bootstrap; later CI
-releases use short-lived credentials without a GitHub registry secret. Manual
-runs default to a dry run. See [RELEASING.md](RELEASING.md) for setup and commands.
+version tags. The trusted publisher is registered on crates.io, and version
+`0.1.0` is published. Subsequent CI releases use short-lived credentials without
+a GitHub registry secret; the first CI publishing run will verify the OIDC
+exchange. Manual runs default to a dry run. See [RELEASING.md](RELEASING.md)
+for configuration and commands.
 
 ## Security and provenance
 

@@ -15,38 +15,21 @@ repository starts at version `0.1.0`, independent of upstream Go releases.
 
 ## crates.io setup
 
-GitHub Actions uses crates.io Trusted Publishing through OIDC, with no stored
-registry secret or API-token fallback. crates.io currently requires an existing
-crate and crate ownership before a trusted publisher can be registered. Bootstrap
-the first `0.1.0` upload locally with an API token, then enable OIDC for CI.
+[`tailcat` version `0.1.0`](https://crates.io/crates/tailcat/0.1.0) was published
+to crates.io on 2026-09-03. The one-time local publication is complete; users
+can install it with `cargo install tailcat --locked`. Version `0.1.0` cannot
+be republished, so the next CI release must use a new version such as `0.1.1`.
+
+The GitHub workflow and crates.io trusted publisher are configured for OIDC,
+with no stored registry secret or API-token fallback. Registration was created
+and verified through the crates.io API on 2026-09-03.
 [Trusted Publishing documentation](https://crates.io/docs/trusted-publishing).
 
-### Publish 0.1.0 once locally
+### Trusted publisher configuration
 
-1. Sign in to [crates.io](https://crates.io/), verify your email in
-   [account settings](https://crates.io/me), and create a short-lived
-   [API token](https://crates.io/settings/tokens) with permission to publish a
-   new crate. Keep it on your local machine; do not add it to GitHub.
-2. From a clean checkout whose `Cargo.toml` version is `0.1.0`, validate and
-   publish. `cargo login` prompts for the token:
-
-   ```sh
-   cargo publish --locked --package tailcat --registry crates-io --dry-run
-   cargo login --registry crates-io
-   cargo publish --locked --package tailcat --registry crates-io
-   cargo logout --registry crates-io
-   ```
-
-3. Confirm that `tailcat` version `0.1.0` is available, then revoke that token
-   in crates.io's token settings.
-
-This publishes `0.1.0`; it cannot be overwritten. The first later CI release
-must bump the package version, for example to `0.1.1`.
-
-### Register the trusted publisher
-
-As the crate owner, open `tailcat` on crates.io, then **Settings → Trusted
-Publishing → Add → GitHub**. Save these fields:
+The registered configuration is below. To recreate it, a crate owner can open
+`tailcat` on crates.io, select **Settings → Trusted Publishing → Add → GitHub**,
+and save these fields:
 
 | Field | Value |
 |---|---|
@@ -62,8 +45,9 @@ The workflow field is a filename, without `.github/workflows/`. In
 The upload job requests a GitHub OIDC identity and exchanges it through
 [rust-lang/crates-io-auth-action](https://github.com/rust-lang/crates-io-auth-action)
 for a short-lived crates.io credential. Validation and dry runs do not request
-credentials. A dry run does not test the OIDC exchange: that remains unverified
-until the registry is configured and an authenticated publishing run succeeds.
+credentials. Registry setup is complete, but the OIDC exchange has not yet run.
+The first CI publication will exercise it; a successful dry run does not verify
+that exchange.
 
 ### Check publication without uploading
 
@@ -96,9 +80,8 @@ whose version matches the package:
 gh workflow run publish-crate.yml --ref v0.1.1 -f dry_run=false
 ```
 
-Replace `v0.1.1` with an unpublished release tag after the local bootstrap.
-Uploads from branches or mismatched tags
-are rejected. Do not reuse a version that is already published; bump the
+Replace `v0.1.1` with an unpublished release tag. Uploads from branches or
+mismatched tags are rejected. Do not reuse a version that is already published; bump the
 manifest version and create a new tag instead.
 
 The crate workflow listens to the tag push directly. It does not wait for the
@@ -109,8 +92,7 @@ publication to that suppressed release event.
 
 ## Prepare and publish a release
 
-1. Complete the local bootstrap and trusted-publisher registration above.
-   Update `Cargo.toml` to a new version (`0.1.1` after the `0.1.0` bootstrap)
+1. Update `Cargo.toml` to a new version (`0.1.1` after the published `0.1.0`)
    before tagging, update `wasm/Cargo.toml` as appropriate, refresh the
    corresponding lockfile package records, and review the release changes.
    Check that the [Test workflow](.github/workflows/test.yml) is green

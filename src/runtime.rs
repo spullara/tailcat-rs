@@ -41,6 +41,9 @@ pub type TcpHandler =
 type PortHandler = Arc<dyn Fn(u16) -> Option<TcpHandler> + Send + Sync>;
 type ForwardHandler = Arc<dyn Fn(SocketAddr) -> Option<TcpHandler> + Send + Sync>;
 const BUFFER_SIZE: usize = 256 * 1024;
+// A TCP window can arrive as a burst of encrypted UDP packets. Small socket
+// defaults drop these bursts before the actor can receive them.
+const UDP_RECEIVE_BUFFER_SIZE: usize = 512 * 1024;
 const MAX_PEERS: usize = 1024;
 // Each stream has two TCP buffers and two bounded application buffers (1 MiB).
 // Include half-open connections in this budget so SYN floods cannot allocate GiB.
@@ -384,8 +387,12 @@ impl Actor {
     ) -> Result<(Self, Handle)> {
         let relay = derp::connect(&key, &region, config.is_some()).await?;
         let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        configure_udp_receive_buffer(&udp).context("configure IPv4 UDP receive buffer")?;
         let port = udp.local_addr()?.port();
         let udp6 = bind_udp6(port).ok().map(Arc::new);
+        if let Some(socket) = &udp6 {
+            configure_udp_receive_buffer(socket).context("configure IPv6 UDP receive buffer")?;
+        }
         let mut endpoints = Vec::new();
         if let Ok(interfaces) = if_addrs::get_if_addrs() {
             for iface in interfaces {
@@ -1168,6 +1175,16 @@ fn remember_endpoint(endpoints: &mut Vec<SocketAddr>, endpoint: SocketAddr) -> b
     }
     endpoints.push(endpoint);
     true
+}
+
+fn configure_udp_receive_buffer(socket: &UdpSocket) -> std::io::Result<()> {
+    let socket = socket2::SockRef::from(socket);
+    // Preserve larger defaults. The OS may clamp this request or account for
+    // buffer space differently, so do not require an exact reported size.
+    if socket.recv_buffer_size()? < UDP_RECEIVE_BUFFER_SIZE {
+        socket.set_recv_buffer_size(UDP_RECEIVE_BUFFER_SIZE)?;
+    }
+    Ok(())
 }
 
 fn bind_udp6(port: u16) -> std::io::Result<UdpSocket> {

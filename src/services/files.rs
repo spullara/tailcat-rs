@@ -615,7 +615,9 @@ impl Files {
                 }
                 let path = self.path(&r.path)?;
                 if let Some(root) = &self.root {
-                    let mut builder = cap_std::fs::DirBuilder::new();
+                    let builder = cap_std::fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    let mut builder = builder;
                     #[cfg(unix)]
                     {
                         use cap_std::fs::DirBuilderExt;
@@ -623,7 +625,9 @@ impl Files {
                     }
                     root.create_dir_with(&path, &builder).map_err(status)?;
                 } else {
-                    let mut builder = fs::DirBuilder::new();
+                    let builder = fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    let mut builder = builder;
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::DirBuilderExt;
