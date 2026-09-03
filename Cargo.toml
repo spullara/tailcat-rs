@@ -49,7 +49,7 @@ rustls-native-certs = "0.8"
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 zstd = "0.13"
 
 [dev-dependencies]
