@@ -1,0 +1,44 @@
+name: External interoperability
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_cli:
+        description: Run the external implementation's complete CLI suite
+        type: boolean
+        default: false
+      browser:
+        description: Also build and test Rust/Wasm in headless Chrome
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo build --locked --bin tailcat
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Install browser build tools
+        if: inputs.browser
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: Build Rust/Wasm browser distribution
+        if: inputs.browser
+        run: cargo run --locked --bin tailcat-webdist -- -o dist
+      - name: Compare with the pinned external reference
+        env:
+          FULL_CLI: ${{ inputs.full_cli }}
+          BROWSER: ${{ inputs.browser }}
+        run: |
+          args=(--binary "$GITHUB_WORKSPACE/target/debug/tailcat")
+          if [[ "$FULL_CLI" == true ]]; then args+=(--full-cli); fi
+          if [[ "$BROWSER" == true ]]; then args+=(--web-dist "$GITHUB_WORKSPACE/dist"); fi
+          python3 scripts/check-interop.py "${args[@]}"

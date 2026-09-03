@@ -1,0 +1,2 @@
+[build.env]
+passthrough = ["TAILCAT_VERSION"]

@@ -1,0 +1,7 @@
+.git
+target
+wasm/target
+dist
+result
+__pycache__
+*.pyc

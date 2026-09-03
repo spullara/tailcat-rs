@@ -1,0 +1,49 @@
+# Publishes the native Rust/Wasm tailcat web demo to GitHub Pages.
+#
+# GitHub Pages is a static host: it can't negotiate Content-Encoding
+# and won't compress application/wasm itself, so instead of the raw
+# main.wasm this publishes only the pre-gzipped main.wasm.gz,
+# which app.js fetches and decompresses via DecompressionStream. The
+# page fetches its DERP map cross-origin from tailcat.dev, which
+# allows CORS requests to /derpmap.json.
+
+name: webdemo-pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: build the web demo dist
+        run: cargo run --locked --bin tailcat-webdist -- -o dist
+      - name: keep only the gzipped wasm
+        run: rm dist/main.wasm dist/main.wasm.zst
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, cross: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, cross: true }
+          - { os: ubuntu-latest, target: armv7-unknown-linux-musleabihf, cross: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, cross: false }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, cross: false }
+          - { os: macos-latest, target: x86_64-apple-darwin, cross: false }
+          - { os: macos-latest, target: aarch64-apple-darwin, cross: false }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAILCAT_VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup target add '${{ matrix.target }}'
+      - name: Install Linux cross compiler
+        if: matrix.cross
+        run: cargo install cross --version 0.2.5 --locked
+      - name: Build static Linux binary
+        if: matrix.cross
+        run: cross build --locked --release --bin tailcat --target '${{ matrix.target }}'
+      - name: Build native platform binary
+        if: ${{ !matrix.cross }}
+        run: cargo build --locked --release --bin tailcat --target '${{ matrix.target }}'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.cross
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Install Linux package builder
+        if: matrix.cross
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+      - name: Package archives and Linux packages
+        run: |
+          python=python3
+          if [[ "$RUNNER_OS" == Windows ]]; then python=python; fi
+          "$python" scripts/package-release.py --target '${{ matrix.target }}' --version "$TAILCAT_VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Checksum release artifacts
+        working-directory: dist
+        run: sha256sum ./* > checksums.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+      - name: Stage static container binaries
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          for arch in amd64 arm64; do
+            mkdir -p "containers/linux/$arch"
+            tar -xzf "dist/tailcat_${version}_linux_${arch}.tar.gz" -C "containers/linux/$arch" tailcat
+          done
+          cp LICENSE THIRD_PARTY_NOTICES.md containers/
+          mkdir -p containers/third_party/boringtun
+          cp third_party/boringtun/LICENSE containers/third_party/boringtun/
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform static Rust image
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}"
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            -f Dockerfile.release -t "$image:$RELEASE_TAG" -t "$image:latest" \
+            --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            --label "org.opencontainers.image.revision=$REVISION" \
+            --label org.opencontainers.image.licenses=BSD-3-Clause containers

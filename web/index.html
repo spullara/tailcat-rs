@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tailcat Rust</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  section { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  code, #listen-addr { font-family: ui-monospace, monospace; word-break: break-all; }
+  #listen-addr { display: block; background: #f4f4f4; padding: 0.5rem; border-radius: 4px; margin: 0.5rem 0; }
+  button { padding: 0.4rem 0.8rem; }
+  #status { color: #555; min-height: 1.2em; }
+  .hidden { display: none; }
+  ul#incoming { padding-left: 1.2rem; }
+  .notice { background: #fff8e1; border: 1px solid #e0c060; border-radius: 4px; padding: 0.5rem 0.8rem; font-size: 0.9rem; }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; }
+  .recv-text { display: block; background: #f4f4f4; padding: 0.5rem; border-radius: 4px; margin: 0.5rem 0; white-space: pre-wrap; max-height: 12rem; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Tailcat Rust</h1>
+<p class="notice">This is an experimental demo of
+<a href="https://github.com/spullara/tailcat-rs">Tailcat Rust</a> in the
+browser. Unlike the normal CLI and non-JS library versions, all of
+its traffic is relayed through DERP
+servers; browsers can't make tailcat's direct peer-to-peer
+connections without WebRTC support
+(<a href="https://github.com/tailscale/tailcat/issues/4">issue #4</a>).</p>
+<p id="status">Loading WebAssembly…</p>
+<progress id="load-progress" max="1" value="0"></progress>
+
+<section id="receive">
+  <h2>Receive</h2>
+  <p>Create a listener, share its address out of band, then the other
+  side sends with this page or the CLI: <code>tailcat &lt;addr&gt; &lt; file</code></p>
+  <label><input type="checkbox" id="persist-key"> Reuse a persistent address (stored in this browser)</label>
+  <p><button id="listen-btn" disabled>Create listener</button></p>
+  <div id="listen-info" class="hidden">
+    Share this address:
+    <span id="listen-addr"></span>
+    <button id="copy-addr">Copy</button>
+  </div>
+  <ul id="incoming"></ul>
+</section>
+
+<section id="send">
+  <h2>Send</h2>
+  <p>Paste the receiver's address. The receiver can be this page on
+  another machine, or the CLI: <code>tailcat &gt; file</code></p>
+  <p><input type="text" id="send-addr" size="40" placeholder="tc…"></p>
+  <p><input type="file" id="send-file">
+  <button id="send-btn" disabled>Send file</button></p>
+  <p><textarea id="send-text" rows="4" placeholder="…or type text to send"></textarea></p>
+  <p><button id="send-text-btn" disabled>Send text</button></p>
+  <p id="send-progress"></p>
+</section>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

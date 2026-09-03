@@ -1,0 +1,9 @@
+# Prebuilt static Rust binaries from the Linux release matrix. Build context:
+# containers/linux/amd64/tailcat and containers/linux/arm64/tailcat.
+FROM gcr.io/distroless/static-debian12:nonroot
+LABEL org.opencontainers.image.source="https://github.com/spullara/tailcat-rs"
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/tailcat /usr/local/bin/tailcat
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/tailcat/
+COPY third_party/boringtun/LICENSE /usr/share/doc/tailcat/boringtun/LICENSE
+ENTRYPOINT ["/usr/local/bin/tailcat"]

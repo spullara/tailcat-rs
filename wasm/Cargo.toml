@@ -1,0 +1,40 @@
+[package]
+name = "tailcat-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "BSD-3-Clause"
+repository = "https://github.com/spullara/tailcat-rs"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+boringtun = { path = "../third_party/boringtun", default-features = false }
+ciborium = "0.2"
+console_error_panic_hook = "0.1"
+crypto_box = { version = "0.9", features = ["salsa20", "getrandom"] }
+getrandom = { version = "0.2", features = ["js"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+hex = "0.4"
+hmac = "0.12"
+js-sys = "0.3"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv6", "socket-tcp"] }
+wasm-bindgen = "0.2.127"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "BinaryType", "CloseEvent", "ErrorEvent", "Event", "MessageEvent", "ReadableStream", "ReadableStreamDefaultReader", "WebSocket", "console"] }
+web-time = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1
