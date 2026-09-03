@@ -15,25 +15,55 @@ repository starts at version `0.1.0`, independent of upstream Go releases.
 
 ## crates.io setup
 
-Before the first upload:
+GitHub Actions uses crates.io Trusted Publishing through OIDC, with no stored
+registry secret or API-token fallback. crates.io currently requires an existing
+crate and crate ownership before a trusted publisher can be registered. Bootstrap
+the first `0.1.0` upload locally with an API token, then enable OIDC for CI.
+[Trusted Publishing documentation](https://crates.io/docs/trusted-publishing).
 
-1. Sign in to [crates.io](https://crates.io/) and verify the email address in
-   [account settings](https://crates.io/me).
-2. Create a [crates.io API token](https://crates.io/settings/tokens) that
-   permits publishing a new crate for the initial `tailcat` upload and new
-   versions for subsequent releases. Choose an appropriate expiration and
-   restrict it to this crate where supported. Existing-crate update permission
-   alone is insufficient for the first publication.
-3. Add the token as an Actions repository secret named
-   **`CARGO_REGISTRY_TOKEN`** in
-   [spullara/tailcat-rs settings](https://github.com/spullara/tailcat-rs/settings/secrets/actions/new).
-   Put the token in the secret value, not in a workflow file or commit.
+### Publish 0.1.0 once locally
 
-The first upload requires the crate name to be available; later uploads require
-crate ownership. Published versions cannot be overwritten. See
-[Cargo's publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html).
-Package validation does not receive registry credentials. Only the upload job
-uses the repository secret; dry runs do not need it.
+1. Sign in to [crates.io](https://crates.io/), verify your email in
+   [account settings](https://crates.io/me), and create a short-lived
+   [API token](https://crates.io/settings/tokens) with permission to publish a
+   new crate. Keep it on your local machine; do not add it to GitHub.
+2. From a clean checkout whose `Cargo.toml` version is `0.1.0`, validate and
+   publish. `cargo login` prompts for the token:
+
+   ```sh
+   cargo publish --locked --package tailcat --registry crates-io --dry-run
+   cargo login --registry crates-io
+   cargo publish --locked --package tailcat --registry crates-io
+   cargo logout --registry crates-io
+   ```
+
+3. Confirm that `tailcat` version `0.1.0` is available, then revoke that token
+   in crates.io's token settings.
+
+This publishes `0.1.0`; it cannot be overwritten. The first later CI release
+must bump the package version, for example to `0.1.1`.
+
+### Register the trusted publisher
+
+As the crate owner, open `tailcat` on crates.io, then **Settings → Trusted
+Publishing → Add → GitHub**. Save these fields:
+
+| Field | Value |
+|---|---|
+| Repository owner | `spullara` |
+| Repository name | `tailcat-rs` |
+| Workflow filename | `publish-crate.yml` |
+| Environment | `crates-io` |
+
+The workflow field is a filename, without `.github/workflows/`. In
+[GitHub environment settings](https://github.com/spullara/tailcat-rs/settings/environments),
+`crates-io` is configured to allow only release tags matching `v*`.
+
+The upload job requests a GitHub OIDC identity and exchanges it through
+[rust-lang/crates-io-auth-action](https://github.com/rust-lang/crates-io-auth-action)
+for a short-lived crates.io credential. Validation and dry runs do not request
+credentials. A dry run does not test the OIDC exchange: that remains unverified
+until the registry is configured and an authenticated publishing run succeeds.
 
 ### Check publication without uploading
 
@@ -63,10 +93,11 @@ After setup and validation, an explicit non-dry manual run must select a tag
 whose version matches the package:
 
 ```sh
-gh workflow run publish-crate.yml --ref v0.1.0 -f dry_run=false
+gh workflow run publish-crate.yml --ref v0.1.1 -f dry_run=false
 ```
 
-Replace `v0.1.0` with the release tag. Uploads from branches or mismatched tags
+Replace `v0.1.1` with an unpublished release tag after the local bootstrap.
+Uploads from branches or mismatched tags
 are rejected. Do not reuse a version that is already published; bump the
 manifest version and create a new tag instead.
 
@@ -78,7 +109,8 @@ publication to that suppressed release event.
 
 ## Prepare and publish a release
 
-1. Complete the crates.io setup above. Update the version in `Cargo.toml`
+1. Complete the local bootstrap and trusted-publisher registration above.
+   Update `Cargo.toml` to a new version (`0.1.1` after the `0.1.0` bootstrap)
    before tagging, update `wasm/Cargo.toml` as appropriate, refresh the
    corresponding lockfile package records, and review the release changes.
    Check that the [Test workflow](.github/workflows/test.yml) is green
@@ -92,18 +124,18 @@ publication to that suppressed release event.
    public key. The script creates a local tag and does not push it:
 
    ```sh
-   ./tag.sh v0.1.0
+   ./tag.sh v0.1.1
    ```
 
 4. Push the tag to start publication:
 
    ```sh
-   git push origin v0.1.0
+   git push origin v0.1.1
    ```
 
 5. Inspect both workflows, the crates.io version, GitHub release assets,
    checksums, and container manifest. After registry publication, check
-   `cargo install tailcat --locked --version 0.1.0` with the released version.
+   `cargo install tailcat --locked --version 0.1.1` with the released version.
    Verify installation and execution on the supported platforms.
 
 ## Artifacts and toolchains
@@ -134,7 +166,7 @@ builds report the package version. A tag alone does not update either manifest.
 ## Containers
 
 The workflow publishes images for `linux/amd64` and `linux/arm64` at
-`ghcr.io/spullara/tailcat-rs`, with the release tag (for example `v0.1.0`) and
+`ghcr.io/spullara/tailcat-rs`, with the release tag (for example `v0.1.1`) and
 `latest`. [Dockerfile.release](Dockerfile.release) consumes the compiled static
 Linux binaries and uses a distroless nonroot runtime. Mount a volume at
 `/home/nonroot` to persist identity and cache state.

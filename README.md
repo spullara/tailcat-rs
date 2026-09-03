@@ -53,7 +53,7 @@ cargo install tailcat --locked
 ```
 
 Until the first publication, use the source installation above. Maintainers can
-set up automatic crate publication with the
+set up OIDC trusted publishing after a one-time local bootstrap with the
 [crates.io release instructions](RELEASING.md#cratesio-setup).
 
 ## Verify
@@ -389,9 +389,10 @@ wire invariants, resource limits, and the verification strategy.
 Cargo, the Makefile, and the Nix flake build Rust. Tagged releases package the
 `tailcat` executable for Linux, macOS, and Windows and publish containers to
 `ghcr.io/spullara/tailcat-rs`. A separate [crate publishing workflow](.github/workflows/publish-crate.yml)
-validates the Cargo package and publishes it to crates.io on a matching version
-tag once its repository secret is configured. Manual runs default to a dry run.
-See [RELEASING.md](RELEASING.md) for setup and release commands.
+validates the Cargo package and uses GitHub OIDC trusted publishing for matching
+version tags. The first `0.1.0` upload requires a local bootstrap; later CI
+releases use short-lived credentials without a GitHub registry secret. Manual
+runs default to a dry run. See [RELEASING.md](RELEASING.md) for setup and commands.
 
 ## Security and provenance
 
