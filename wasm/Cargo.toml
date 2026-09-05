@@ -26,7 +26,7 @@ js-sys = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv6", "socket-tcp"] }
 wasm-bindgen = "0.2.127"
 wasm-bindgen-futures = "0.4"
