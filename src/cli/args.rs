@@ -6,7 +6,7 @@ use std::{collections::BTreeSet, time::Duration};
 
 pub const COMMANDS: &[&str] = &[
     "serve", "recv", "ping", "socks", "ssh", "cp", "ls", "forward", "parse", "resolve", "genkey",
-    "printpub", "version", "readme",
+    "printpub", "version", "readme", "browse", "perf",
 ];
 pub const DEFAULT_DERP_MAP_URL: &str = "https://tailcat.dev/derpmap.json";
 
@@ -21,6 +21,21 @@ pub struct Args {
     pub derp_map_url: String,
     pub allow: String,
     pub full_address: bool,
+    pub psk: bool,
+    pub exec: Vec<String>,
+    pub open_browser: bool,
+    pub perf_udp: bool,
+    pub reverse: bool,
+    pub bidir: bool,
+    pub via_derp: bool,
+    pub perf_time: Duration,
+    pub perf_bytes: u64,
+    pub parallel: usize,
+    pub length: usize,
+    pub bitrate: Option<u64>,
+    pub interval: Duration,
+    pub ssh_authorized_keys: String,
+    pub skip_dns_safety_check: bool,
     pub files: String,
     pub accept_dirs: bool,
     pub until_direct: bool,
@@ -58,6 +73,21 @@ impl Default for Args {
                 .unwrap_or_else(|| DEFAULT_DERP_MAP_URL.into()),
             allow: String::new(),
             full_address: false,
+            psk: true,
+            exec: vec![],
+            open_browser: false,
+            perf_udp: false,
+            reverse: false,
+            bidir: false,
+            via_derp: false,
+            perf_time: Duration::from_secs(10),
+            perf_bytes: 0,
+            parallel: 1,
+            length: 0,
+            bitrate: None,
+            interval: Duration::from_secs(1),
+            ssh_authorized_keys: String::new(),
+            skip_dns_safety_check: false,
             files: String::new(),
             accept_dirs: false,
             until_direct: false,
@@ -90,6 +120,9 @@ impl Args {
         while i < input.len() {
             let arg = &input[i];
             if arg == "--" {
+                if out.command.is_empty() {
+                    out.command = "serve".into();
+                }
                 out.positional.extend_from_slice(&input[i + 1..]);
                 break;
             }
@@ -120,7 +153,11 @@ impl Args {
             let server = out.command == "serve" || out.command == "recv";
             let boolean = match name {
                 "--verbose" | "--json" => true,
+                "--udp" | "--reverse" | "--bidir" | "--via-derp" if out.command == "perf" => true,
+                "--open-browser" if out.command == "forward" => true,
+                "--skip-dns-safety-check" if out.command == "ssh" => true,
                 "--full-address" if server => true,
+                "--psk" if server || out.command == "genkey" => true,
                 "--accept-dirs" if out.command == "recv" => true,
                 "--until-direct" if out.command == "ping" => true,
                 "-r" | "-p" if out.command == "cp" => true,
@@ -157,6 +194,27 @@ impl Args {
             };
             let yes = value == "true";
             match name {
+                "--psk" if server || out.command == "genkey" => out.psk = yes,
+                "--ssh-authorized-keys" if server => out.ssh_authorized_keys = value,
+                "--skip-dns-safety-check" if out.command == "ssh" => {
+                    out.skip_dns_safety_check = yes
+                }
+                "--open-browser" if out.command == "forward" => out.open_browser = yes,
+                "--udp" if out.command == "perf" => out.perf_udp = yes,
+                "--reverse" if out.command == "perf" => out.reverse = yes,
+                "--bidir" if out.command == "perf" => out.bidir = yes,
+                "--via-derp" if out.command == "perf" => out.via_derp = yes,
+                "--time" if out.command == "perf" => out.perf_time = parse_duration(&value)?,
+                "--bytes" if out.command == "perf" => {
+                    out.perf_bytes = parse_si(&value)?;
+                    if out.perf_bytes == 0 {
+                        bail!("--bytes must be positive");
+                    }
+                }
+                "--parallel" if out.command == "perf" => out.parallel = value.parse()?,
+                "--length" if out.command == "perf" => out.length = value.parse()?,
+                "--bitrate" if out.command == "perf" => out.bitrate = Some(parse_si(&value)?),
+                "--interval" if out.command == "perf" => out.interval = parse_duration(&value)?,
                 "--serve" => out.serve = value,
                 "--key" if out.command == "genkey" => out.genkey_key = value,
                 "--key" => out.key = value,
@@ -168,7 +226,9 @@ impl Args {
                 "--files" if server => out.files = value,
                 "--accept-dirs" if out.command == "recv" => out.accept_dirs = yes,
                 "--until-direct" if out.command == "ping" => out.until_direct = yes,
-                "--timeout" if out.command == "ping" => out.timeout = parse_duration(&value)?,
+                "--timeout" if out.command == "ping" || out.command == "perf" => {
+                    out.timeout = parse_duration(&value)?
+                }
                 "--listen" if out.command == "socks" => out.listen = value,
                 "--bind" if out.command == "forward" => out.bind = value,
                 "-p" if out.command == "ssh" => out.port = value,
@@ -188,8 +248,41 @@ impl Args {
             out.explicit.insert(name.trim_start_matches('-').to_owned());
             i += 1;
         }
+        if out.command.is_empty()
+            && out.serve.is_empty()
+            && out.positional.iter().any(|s| s == "--")
+        {
+            bail!("command after -- is only valid in server mode");
+        }
+        if (out.command == "serve" || !out.serve.is_empty())
+            && let Some(separator) = input.iter().position(|s| s == "--")
+        {
+            out.exec = input[separator + 1..].to_vec();
+            if out.exec.is_empty() {
+                bail!("no command given after --");
+            }
+            out.positional
+                .truncate(out.positional.len() - out.exec.len());
+            if out.positional.last().is_some_and(|s| s == "--") {
+                out.positional.pop();
+            }
+        }
         Ok(out)
     }
+}
+
+pub fn parse_si(value: &str) -> Result<u64> {
+    let (number, multiplier) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1e3),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1e6),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1e9),
+        _ => (value, 1.0),
+    };
+    let n = number.parse::<f64>()? * multiplier;
+    if !n.is_finite() || n < 0.0 || n >= i64::MAX as f64 {
+        bail!("number out of range");
+    }
+    Ok(n as u64)
 }
 
 pub fn parse_duration(value: &str) -> Result<Duration> {
@@ -228,8 +321,8 @@ pub fn help(command: &str) -> String {
     let (usage, description, flags) = match command {
         "serve" => (
             "tailcat serve [flags] [<port,service,...> ...]",
-            "Serve local ports, ranges, all, exit-node, no-auth-ssh, or files.\nWith no services, accept one connection and copy it to stdout.",
-            "  --allow <keys|none>  Allowed node public keys\n  --full-address      Embed relay information in the address\n  --files <dir[:ro|rw|wo|wo+]>  File directory (default current directory, read-only)\n",
+            "Serve ports, port:target mappings, ranges, all, exit-node, ssh, no-auth-ssh, files, exec, or perf.\nWith no services, accept one connection and copy it to stdout.",
+            "  --psk <bool>  Include a WireGuard pre-shared key (default true)\n  --ssh-authorized-keys <sources>  Public keys, files, or user@github\n  --allow <keys|none>  Allowed node public keys\n  --full-address      Embed relay information in the address\n  --files <dir[:ro|rw|wo|wo+]>  File directory (default current directory, read-only)\n",
         ),
         "recv" => (
             "tailcat recv [flags] [<dir>]",
@@ -249,7 +342,7 @@ pub fn help(command: &str) -> String {
         "ssh" => (
             "tailcat ssh [-p <port|ip:port>] [user@]<tc-addr> [<command> [args...]]",
             "Connect the system SSH client through tailcat.",
-            "  -p <port|ip:port>  SSH port (default 22); a bare IP means port 22\n",
+            "  --skip-dns-safety-check  Skip the stranger probe for DNS destinations\n  -p <port|ip:port>  SSH port (default 22); a bare IP means port 22\n",
         ),
         "cp" => (
             "tailcat cp [-r] [-p] [-P <port>] <source>... <target>",
@@ -264,12 +357,22 @@ pub fn help(command: &str) -> String {
         "forward" => (
             "tailcat forward [flags] <tc-addr> <[local:]remote-port|local-port:remote-ip:remote-port> ...",
             "Forward local TCP listeners to a tailcat server. Local port 0 selects a free port.",
-            "  --bind <address>  Local bind address (default 127.0.0.1)\n",
+            "  --open-browser  Open the single forwarded port in a browser\n  --bind <address>  Local bind address (default 127.0.0.1)\n",
         ),
         "genkey" => (
             "tailcat genkey --key=<name> [flags]",
             "Generate, list, or delete saved keys. Server default: default; client default: client-default.",
-            "  --key <name|path>  Required key name or path\n  --client  Create client identity only\n  --force   Overwrite an existing key\n  --delete  Delete the named key\n  --list    List saved key names\n  --region <auto|list|id|code|hostname>  Relay selection (default auto)\n  --fixed-region  Pick the nearest region now\n  --embed-derp-map  Embed relay nodes in the address\n",
+            "  --key <name|path>  Required key name or path\n  --psk <bool>  Include a server pre-shared key (default true)\n  --client  Create client identity only\n  --force   Overwrite an existing key\n  --delete  Delete the named key\n  --list    List saved key names\n  --region <auto|list|id|code|hostname>  Relay selection (default auto)\n  --fixed-region  Pick the nearest region now\n  --embed-derp-map  Embed relay nodes in the address\n",
+        ),
+        "browse" => (
+            "tailcat browse <tc-addr>",
+            "Forward port 80 to a free local port and open a browser.",
+            "",
+        ),
+        "perf" => (
+            "tailcat perf [flags] <tc-addr>",
+            "Measure TCP or UDP throughput and loaded latency. Requires serve perf.",
+            "  --udp  Test UDP instead of TCP\n  --reverse  Server sends\n  --bidir  Send both ways\n  --time <duration>  Default 10s\n  --bytes <count>  Bytes per stream; K/M/G suffixes accepted\n  --parallel <count>  Default 1\n  --length <bytes>  Write or datagram size\n  --bitrate <bits/s>  Pace each stream\n  --interval <duration>  Default 1s\n  --timeout <duration>  Wait for a direct path (default 10s)\n  --via-derp  Permit your own relay; shared Tailscale relays are refused\n",
         ),
         "parse" => (
             "tailcat parse <tc-addr>",
@@ -290,7 +393,7 @@ pub fn help(command: &str) -> String {
         "readme" => ("tailcat readme", "Print the complete README.", ""),
         _ => (
             "tailcat [flags] [<subcommand> [flags]] [args...]",
-            "Securely pipe or serve network connections over WireGuard and DERP, without a control plane.\nNo arguments: accept one connection into stdout. <tc-addr> [port]: pipe stdin/stdout (default port 1).\nAddresses may be DNS names with a tailcat= TXT record.",
+            "Securely pipe or serve network connections over WireGuard and DERP, without a control plane.\nNo arguments: accept one connection into stdout. <tc-addr> [port]: pipe stdin/stdout (default port 1).\nAddresses may be DNS names with a tailcat= TXT record.\nDNS TXT records are public. Protect shell access with --allow or --ssh-authorized-keys.",
             "",
         ),
     };

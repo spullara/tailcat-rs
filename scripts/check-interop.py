@@ -3,12 +3,13 @@
 
 The default runs both Go-library/Rust-CLI and Go-CLI/Rust-CLI pairings.
 Use --full-cli for the entire reference CLI suite, and --web-dist to also test
-the Rust browser distribution against Go peers. No Go source is retained in
-this repository. Git and Go are required; browser tests also require Chrome
+the Rust browser distribution against Go peers. Only Go test hooks are retained in this repository; the reference runtime
+is fetched into a temporary checkout. Git and Go are required; browser tests also require Chrome
 or Chromium (CHROME_BIN selects its executable).
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -20,8 +21,8 @@ import sys
 import tempfile
 
 
-REFERENCE_URL = "https://github.com/spullara/tailcat.git"
-REFERENCE_COMMIT = "689b74e2405c18fbdf4b21a0610d8c1abae8f334"
+REFERENCE_URL = "https://github.com/tailscale/tailcat.git"
+REFERENCE_COMMIT = "83921d7141b80db20fd733ee195c805d2721e489"
 
 
 def stop_process_tree(process):
@@ -76,9 +77,30 @@ def run(argv, *, cwd, env, timeout, capture=False):
         stop_process_tree(process)
         raise
     if process.returncode:
+        if capture and output:
+            print(output, flush=True)
         stop_process_tree(process)
         raise subprocess.CalledProcessError(process.returncode, argv)
     return output
+
+
+def run_tests(argv, *, required_tests, **kwargs):
+    output = run(argv, capture=True, **kwargs)
+    passed = 0
+    completed = set()
+    for line in output.splitlines():
+        event = json.loads(line)
+        if event.get("Output"):
+            print(event["Output"], end="", flush=True)
+        if event.get("Test") and event.get("Action") == "pass":
+            passed += 1
+            completed.add(event["Test"])
+    if not passed:
+        raise RuntimeError("compatibility test selection executed no passing tests")
+    missing = set(required_tests) - completed
+    if missing:
+        raise RuntimeError(f"required compatibility tests did not pass: {sorted(missing)}")
+    print(f"Verified {passed} passing test results", flush=True)
 
 
 def parse_args():
@@ -162,19 +184,22 @@ def main():
             raise RuntimeError(f"reference checkout is {actual}, expected {REFERENCE_COMMIT}")
         print(f"Testing against {REFERENCE_URL} at {actual}", flush=True)
 
-        native = ["go", "test", "-count=1", "-timeout=600s", "-v"]
+        run([*git, "apply", str(Path(__file__).with_name("interop-harness.patch").resolve())],
+            cwd=reference, env=env, timeout=30)
+        native = ["go", "test", "-json", "-count=1", "-timeout=600s", "-v"]
         if not args.full_cli:
             native += ["-run", "^TestRustInterop"]
         native.append("./cmd/tailcat")
         # The subprocess budget also covers downloading Go's pinned toolchain
         # and compiling dependencies, which go test's -timeout does not cover.
-        run(native, cwd=reference, env=env, timeout=1800)
+        run_tests(native, required_tests=["TestRustInterop", "TestRustInteropBinaries", "TestRustInteropPerf"], cwd=reference, env=env, timeout=1800)
         if args.web_dist is not None:
-            run(
+            run_tests(
                 [
-                    "go", "test", "-count=1", "-timeout=180s", "-v", "-run",
+                    "go", "test", "-json", "-count=1", "-timeout=180s", "-v", "-run",
                     "^TestBrowser", "./web", "-run-headless-browser-tests",
                 ],
+                required_tests=["TestBrowserReceives", "TestBrowserSends", "TestBrowserSendsTextUI", "TestBrowserReceivesTextUI", "TestBrowserClosedConnectionIsolation"],
                 cwd=reference,
                 env=env,
                 timeout=1200,

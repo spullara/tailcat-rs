@@ -9,8 +9,10 @@ The protocol and application behavior originate in
 [tailscale/tailcat](https://github.com/tailscale/tailcat). This standalone source
 was extracted from the independent Rust port in
 [spullara/tailcat at `689b74e2405c18fbdf4b21a0610d8c1abae8f334`](https://github.com/spullara/tailcat/tree/689b74e2405c18fbdf4b21a0610d8c1abae8f334).
-That external snapshot supplies the optional Go compatibility tests. This
-repository contains no Go source or imported Go commit history.
+The compatibility baseline is now original upstream commit
+[`83921d7`](https://github.com/tailscale/tailcat/tree/83921d7141b80db20fd733ee195c805d2721e489).
+A test-only patch preserves the fork's Rust test hooks and adds mixed performance
+tests. Go runs only in temporary test checkouts; it is not part of the application.
 
 ## Source map
 
@@ -18,6 +20,9 @@ repository contains no Go source or imported Go commit history.
 |---|---|
 | [src/lib.rs](../src/lib.rs) | Public modules and client/server type exports |
 | [src/runtime.rs](../src/runtime.rs) | Native actor, lifecycle, bounded streams, WireGuard, smoltcp, STUN/disco, direct paths, status snapshots |
+| [src/runtime/datagram.rs](../src/runtime/datagram.rs) | Bounded UDP flows, idle expiry, and runtime listener claims |
+| [src/perf.rs](../src/perf.rs) | Compatible performance control/data protocol, pacing and measurements |
+| [src/services/authorized_keys.rs](../src/services/authorized_keys.rs), [src/services/process.rs](../src/services/process.rs) | SSH key sources and per-connection programs |
 | [src/protocol.rs](../src/protocol.rs) | Key derivation, address serialization, DERP metadata, region selection, persistent map cache, NAT64 addressing |
 | [src/derp.rs](../src/derp.rs) | TLS/HTTP upgrade, DERP authentication and frames, reconnecting relay transport, local test relay |
 | [src/bin/tailcat.rs](../src/bin/tailcat.rs), [src/cli/mod.rs](../src/cli/mod.rs) | Executable entry and command dispatch |
@@ -104,8 +109,8 @@ than blocking the packet-processing actor indefinitely.
    `github.com/tailscale/tailcat disco key v1`, then clamped. Exposing a disco
    public key must not expose the node public key that grants access.
 2. An address is `tc` followed by unpadded URL-safe base64 of CBOR. Top-level
-   keys are `p` (node key), `k` (disco key), `r` (embedded regions), and `i`
-   (region ID). Both keys are CBOR byte strings, not strings or integer arrays.
+   keys are `p` (node key), `k` (disco key), `q` (WireGuard PSK), `r` (embedded regions), and `i`
+   (region ID). All keys are CBOR byte strings, not strings or integer arrays.
    Encoding omits redundant region IDs/names; parsing reconstructs them.
    The address vocabulary is deliberately independent of upstream DERP structs.
 3. A DERP frame is one type byte plus a big-endian 32-bit payload length. The
@@ -126,8 +131,8 @@ than blocking the packet-processing actor indefinitely.
    UDP paths, refreshes candidate probes, and falls back to DERP when a direct
    path expires. This is a focused implementation of the protocols tailcat
    uses, not a port of every upstream magicsock feature.
-7. Exit-node TCP targets use IPv6 in the tunnel. IPv4 destinations are encoded
-   under `64:ff9b::/96` and converted back before the server's host TCP dial.
+7. Exit-node TCP and UDP targets use IPv6 in the tunnel. IPv4 destinations are encoded
+   under `64:ff9b::/96` and converted back before the server's host socket dial.
 8. TCP EOF is directional. After application EOF, send FIN while continuing
    to receive the response. Drain FIN/ACK work before dropping the userspace
    stack; otherwise a successful-looking process exit can truncate traffic or
@@ -136,7 +141,7 @@ than blocking the packet-processing actor indefinitely.
 ## Services
 
 The CLI preserves the Tailcat command surface: default pipe mode, `serve`,
-`recv`, `ping`, `socks`, `forward`, `ssh`, `cp`, `ls`, `parse`, `resolve`,
+`recv`, `ping`, `perf`, `socks`, `forward`, `browse`, `ssh`, `cp`, `ls`, `parse`, `resolve`,
 `genkey`, `printpub`, `version`, and `readme`. Flags stop at the first positional
 argument so child command flags pass through unchanged. Saved keys preserve
 the reference implementation's JSON/key encodings and default/client-default selection conventions.
@@ -151,7 +156,8 @@ by default; exit-node destinations are explicit IP addresses or locally resolved
 hostnames, while `server.tailcat` selects the server itself.
 
 The built-in SSH server accepts session channels, runs as the current OS user,
-and has no separate user authentication. Shell access and file access are
+and supports either authentication-free access or an explicit SSH key allowlist.
+Shell access and file access are
 independent capabilities. Only TERM, LANG, and LC_* environment variables are
 accepted from the client. Non-PTY stdout and stderr stay separate; PTYs preserve
 terminal size and control-character behavior. SSH exit status is sent after
@@ -195,8 +201,11 @@ surviving a completed close handshake. Binaries and examples are also compiled.
 ### Optional external interoperability
 
 [scripts/check-interop.py](../scripts/check-interop.py) fetches the pinned
-[reference snapshot](https://github.com/spullara/tailcat/tree/689b74e2405c18fbdf4b21a0610d8c1abae8f334)
-into a temporary directory. It does not copy Go sources into this repository.
+[upstream snapshot](https://github.com/tailscale/tailcat/tree/83921d7141b80db20fd733ee195c805d2721e489)
+into a temporary directory and applies `scripts/interop-harness.patch`.
+The patch changes test hooks only, adds mixed Go/Rust performance tests, and
+waits for browser test state to exist before polling it. The runner requires
+each selected test group to pass; an empty or skipped selection is an error.
 It requires Python 3, Git, Go 1.27, and network access to fetch the reference
 and its dependencies; traffic tests themselves use a local DERP relay.
 
@@ -222,7 +231,9 @@ it, exercising bidirectional delivery and half-close. Separate
 that every bulk-transfer packet used UDP.
 
 The full CLI suite covers pipes, ping, port serving, exit nodes, SOCKS,
-forwarding, SSH, copying, receiving, and listing. It runs against the supplied
+forwarding, SSH authentication, forced commands, exec, port mappings, performance,
+copying, receiving, and listing. Mixed performance tests exercise TCP/UDP, both
+client/server implementations, all directions, and parallel streams. It runs against the supplied
 Rust executable through the reference test harness's `TAILCAT_TEST_BINARY`
 setting. The browser option points that harness's `TAILCAT_WEB_DIST` at a
 Rust-built distribution and additionally requires Chrome/Chromium. Its tests
@@ -273,3 +284,27 @@ The standalone checkout was also checked on macOS on 2026-09-03:
 The external test runner fetched the pinned reference into a temporary directory
 and removed it afterward. Linux/Windows execution, Docker, and Nix remain checks
 for their respective environments.
+
+
+### Updating from upstream
+
+The extraction revision above is historical provenance. The compatibility
+revision is `REFERENCE_COMMIT` in `scripts/check-interop.py`; update it only after
+reviewing the original repository's intervening commits and porting applicable
+behavior. Recheck the test-only patch against the new revision, run native
+checks plus `make interop-full` and `make interop-web`, and record the new baseline.
+Go-only dependency and packaging changes do not translate into Rust dependencies.
+
+The September 2026 update adds PSKs in native and WASM tunnels, SSH key sources
+and DNS safety probes, peer process identity, UDP/SOCKS/exit-node flows, listener
+APIs, exec and SSH forced commands, browser opening, port mappings, and the perf
+protocol. Native and browser TCP use CUBIC. The native DERP reader applies bounded
+backpressure to preserve received bursts. Single-region selection skips probes.
+
+Termux loader argument handling is guarded for Android builds. This does not
+claim that an ordinary Linux executable works unchanged on Android: Go-specific
+Android resolver and certificate integrations are not present in the Rust port.
+Windows/macOS/BSD/Android runtime checks require their respective environments;
+the local update verification uses Linux ARM64. Direct discovery tests use local
+peers, not separate runner VMs. Existing Rust packaging remains independent of
+upstream Go/Nix/Snap release infrastructure.

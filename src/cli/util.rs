@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use hickory_resolver::TokioAsyncResolver;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -252,6 +252,7 @@ pub fn normalize_listen(value: &str) -> String {
 #[derive(Debug, Default)]
 pub struct ServeSpec {
     pub ports: BTreeSet<u16>,
+    pub targets: BTreeMap<u16, String>,
     pub services: BTreeSet<String>,
 }
 
@@ -263,8 +264,31 @@ pub fn parse_serve_spec(value: &str) -> Result<ServeSpec> {
     for part in value.trim().split(',').map(str::trim) {
         match part {
             "all" => spec.ports.extend(1..=u16::MAX),
-            "exit-node" | "no-auth-ssh" | "files" => {
+            "exec" | "perf" | "exit-node" | "ssh" | "no-auth-ssh" | "files" => {
                 spec.services.insert(part.into());
+            }
+            _ if part.contains(':') => {
+                let (port, target) = part.split_once(':').unwrap();
+                let port = decimal_port(port, false)?;
+                let target = if target.bytes().all(|b| b.is_ascii_digit()) && !target.is_empty() {
+                    format!("localhost:{}", decimal_port(target, true)?)
+                } else {
+                    let (host, p) = target
+                        .rsplit_once(':')
+                        .context("mapping target must be a port or host:port")?;
+                    if host.is_empty()
+                        || (host.contains(':') && !(host.starts_with('[') && host.ends_with(']')))
+                    {
+                        bail!("invalid mapping target");
+                    }
+                    format!("{host}:{}", decimal_port(p, false)?)
+                };
+                if let Some(old) = spec.targets.insert(port, target.clone())
+                    && old != target
+                {
+                    bail!("port {port} is mapped to both {old} and {target}");
+                }
+                spec.ports.insert(port);
             }
             _ => {
                 let (a, b) = part.split_once('-').unwrap_or((part, part));

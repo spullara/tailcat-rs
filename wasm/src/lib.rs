@@ -189,6 +189,7 @@ async fn listen(options: JsValue) -> Result<JsValue> {
         let private = PrivateKey::new();
         let mut public = ConnInfo::for_key(&private);
         public.region_id = -1;
+        public.preshared_key = Some(rand::random());
         SavedKey { private, public }
     } else {
         serde_json::from_str(&existing).context("parsing privateKey")?
@@ -203,7 +204,14 @@ async fn listen(options: JsValue) -> Result<JsValue> {
     }
     let addr = saved.public.addr()?;
     let key_json = serde_json::to_string(&saved)?;
-    let engine = Engine::create(saved.private, ci.region[0].clone(), None, Some(callback)).await?;
+    let engine = Engine::create(
+        saved.private,
+        ci.region[0].clone(),
+        None,
+        ci.preshared_key,
+        Some(callback),
+    )
+    .await?;
     run_engine(engine.clone());
     let object = Object::new();
     set(&object, "addr", &addr.into())?;
@@ -240,7 +248,14 @@ async fn dial(options: JsValue) -> Result<JsValue> {
     }
     expand(&mut ci, &url, false).await?;
     let server = ci.server_public;
-    let engine = Engine::create(key, ci.region[0].clone(), Some(ci), None).await?;
+    let engine = Engine::create(
+        key,
+        ci.region[0].clone(),
+        Some(ci.clone()),
+        ci.preshared_key,
+        None,
+    )
+    .await?;
     run_engine(engine.clone());
     let start = Instant::now();
     loop {
@@ -578,6 +593,7 @@ struct Engine {
     local: Ipv6Addr,
     server: Option<[u8; 32]>,
     on_connection: Option<Function>,
+    preshared_key: Option<[u8; 32]>,
     peers: HashMap<[u8; 32], Peer>,
     device: PacketDevice,
     iface: Interface,
@@ -599,6 +615,7 @@ impl Engine {
         key: PrivateKey,
         region: Region,
         server: Option<ConnInfo>,
+        preshared_key: Option<[u8; 32]>,
         on_connection: Option<Function>,
     ) -> Result<SharedEngine> {
         let ws = Ws::connect(&key, &region, server.is_none()).await?;
@@ -621,6 +638,7 @@ impl Engine {
             local,
             server: server.as_ref().map(|s| s.server_public),
             on_connection,
+            preshared_key,
             peers: HashMap::new(),
             device,
             iface,
@@ -653,7 +671,7 @@ impl Engine {
         let tunnel = Tunn::new(
             self.key.0.into(),
             key.into(),
-            None,
+            self.preshared_key,
             Some(25),
             self.peers.len() as u32 + 1,
             None,
@@ -1017,6 +1035,7 @@ fn tcp_socket() -> tcp::Socket<'static> {
         tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
         tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
     );
+    socket.set_congestion_control(tcp::CongestionControl::Cubic);
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
     socket.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));

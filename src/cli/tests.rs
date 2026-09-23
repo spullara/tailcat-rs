@@ -16,7 +16,8 @@ fn command_tree_and_flag_placement() {
         assert!(help("").contains(command));
     }
     assert!(help("serve").contains("--allow"));
-    assert!(!help("").contains("--allow"));
+    assert!(!help("").contains("\n  --allow"));
+    assert!(help("").contains("DNS TXT records are public"));
     for input in [
         vec![
             "--key=new",
@@ -372,4 +373,21 @@ async fn key_validation_precedes_creation() {
     ] {
         assert!(genkey(&args).await.is_err());
     }
+}
+
+#[test]
+fn exec_separator_preserves_command_arguments() {
+    for input in [
+        vec!["--", "sh", "-c", "cat", "--"],
+        vec!["serve", "--", "sh", "-c", "cat", "--"],
+        vec!["--serve=exec", "--", "sh", "-c", "cat", "--"],
+        vec!["serve", "--json", "--", "sh", "-c", "cat", "--"],
+    ] {
+        let args = parse(&input);
+        assert!(args.positional.is_empty(), "{input:?}");
+        assert_eq!(args.exec, ["sh", "-c", "cat", "--"]);
+    }
+    let args = parse(&["serve", "exec", "--", "cat"]);
+    assert_eq!(args.positional, ["exec"]);
+    assert_eq!(args.exec, ["cat"]);
 }

@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Native SSH, SFTP, and file sharing over an authenticated tailcat stream.
+mod authorized_keys;
 mod files;
+mod process;
 mod shell;
+pub use authorized_keys::{load_authorized_keys, parse_authorized_keys};
+pub use process::{exec_handler, resolve_command};
 
 use std::collections::HashMap;
 use std::io;
@@ -25,6 +29,8 @@ pub use files::{FileMode, FileShare};
 pub struct SshConfig {
     pub shell: bool,
     pub files: Option<FileShare>,
+    pub forced_command: Vec<String>,
+    pub authorized_keys: Option<Vec<russh::keys::PublicKey>>,
     config: Arc<server::Config>,
 }
 
@@ -45,6 +51,8 @@ impl SshConfig {
         Ok(Self {
             shell,
             files,
+            authorized_keys: None,
+            forced_command: vec![],
             config: Arc::new(config),
         })
     }
@@ -113,6 +121,7 @@ where
         SshSession {
             config,
             pending: HashMap::new(),
+            environment: crate::runtime::connection_env(),
         },
     )
     .await?
@@ -128,6 +137,7 @@ struct Pending {
 struct SshSession {
     config: Arc<SshConfig>,
     pending: HashMap<ChannelId, Pending>,
+    environment: HashMap<String, String>,
 }
 
 impl SshSession {
@@ -143,6 +153,7 @@ impl SshSession {
                 command,
                 pending.env,
                 pending.terminal,
+                self.config.forced_command.clone(),
             ));
         } else {
             tokio::spawn(async move {
@@ -161,7 +172,30 @@ impl server::Handler for SshSession {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, _user: &str) -> Result<server::Auth> {
-        Ok(server::Auth::Accept)
+        Ok(if self.config.authorized_keys.is_none() {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        public_key: &russh::keys::PublicKey,
+    ) -> Result<server::Auth> {
+        Ok(
+            if self
+                .config
+                .authorized_keys
+                .as_ref()
+                .is_some_and(|keys| keys.iter().any(|k| k.key_data() == public_key.key_data()))
+            {
+                server::Auth::Accept
+            } else {
+                server::Auth::reject()
+            },
+        )
     }
 
     async fn channel_open_session(
@@ -174,7 +208,7 @@ impl server::Handler for SshSession {
             channel.id(),
             Pending {
                 channel,
-                env: HashMap::new(),
+                env: self.environment.clone(),
                 terminal: None,
             },
         );
@@ -255,7 +289,10 @@ impl server::Handler for SshSession {
         name: &str,
         session: &mut Session,
     ) -> Result<()> {
-        if name != "sftp" || (!self.config.shell && self.config.files.is_none()) {
+        if !self.config.forced_command.is_empty()
+            || name != "sftp"
+            || (!self.config.shell && self.config.files.is_none())
+        {
             session.channel_failure(id)?;
             return Ok(());
         }
@@ -336,6 +373,22 @@ impl russh::client::Handler for TunnelClient {
         // Tailcat's authenticated WireGuard key already identifies the server.
         Ok(true)
     }
+}
+
+pub async fn probe_no_auth<S>(stream: S, user: &str) -> Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut ssh = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        stream,
+        TunnelClient,
+    )
+    .await?;
+    let accepted = ssh.authenticate_none(user).await?.success();
+    ssh.disconnect(russh::Disconnect::ByApplication, "probe complete", "en")
+        .await?;
+    Ok(accepted)
 }
 
 /// List a directory (sorted by name), or return the named file as one entry.

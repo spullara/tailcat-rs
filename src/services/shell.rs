@@ -78,7 +78,17 @@ fn command_spec(command: &str, forwarded: &HashMap<String, String>) -> Result<Co
     env.extend(
         forwarded
             .iter()
-            .filter(|(k, v)| accepted_env(k) && !v.contains('\0'))
+            .filter(|(k, v)| {
+                (accepted_env(k)
+                    || matches!(
+                        k.as_str(),
+                        "TAILCAT_PEER_KEY"
+                            | "TAILCAT_REMOTE_ADDR"
+                            | "TAILCAT_LOCAL_ADDR"
+                            | "SSH_ORIGINAL_COMMAND"
+                    ))
+                    && !v.contains('\0')
+            })
             .map(|(k, v)| (k.clone(), v.clone())),
     );
     Ok(CommandSpec {
@@ -212,12 +222,23 @@ pub(super) async fn run(
     command: String,
     env: HashMap<String, String>,
     terminal: Option<Terminal>,
+    forced: Vec<String>,
 ) {
+    if terminal.is_some() && command.is_empty() {
+        let _ = channel.data(&b"Connected via tailcat SSH.\r\n"[..]).await;
+    }
     let result = match command_spec(&command, &env) {
-        Ok(spec) => match terminal {
-            Some(term) => run_pty(channel, spec, term).await,
-            None => run_pipes(channel, spec).await,
-        },
+        Ok(mut spec) => {
+            if !forced.is_empty() {
+                spec.program = forced[0].clone();
+                spec.args = forced[1..].to_vec();
+                spec.env.insert("SSH_ORIGINAL_COMMAND".into(), command);
+            }
+            match terminal {
+                Some(term) => run_pty(channel, spec, term).await,
+                None => run_pipes(channel, spec).await,
+            }
+        }
         Err(err) => {
             let _ = channel
                 .extended_data(1, format!("tailcat: {err}\r\n").as_bytes())

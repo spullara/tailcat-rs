@@ -36,8 +36,34 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod datagram;
+pub use datagram::{
+    AcceptedConnection, DatagramStream, Listener, UdpForwardHandler, UdpHandler, UdpPortHandler,
+};
 pub type TcpHandler =
     Arc<dyn Fn(DuplexStream) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+/// Authenticated metadata available while a TCP service handler runs.
+#[derive(Clone, Debug)]
+pub struct ConnectionInfo {
+    pub peer_key: [u8; 32],
+    pub remote_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+tokio::task_local! { pub static CONNECTION_INFO: ConnectionInfo; }
+pub fn connection_env() -> HashMap<String, String> {
+    CONNECTION_INFO
+        .try_with(|c| {
+            HashMap::from([
+                (
+                    "TAILCAT_PEER_KEY".into(),
+                    format!("nodekey:{}", hex::encode(c.peer_key)),
+                ),
+                ("TAILCAT_REMOTE_ADDR".into(), c.remote_addr.to_string()),
+                ("TAILCAT_LOCAL_ADDR".into(), c.local_addr.to_string()),
+            ])
+        })
+        .unwrap_or_default()
+}
 type PortHandler = Arc<dyn Fn(u16) -> Option<TcpHandler> + Send + Sync>;
 type ForwardHandler = Arc<dyn Fn(SocketAddr) -> Option<TcpHandler> + Send + Sync>;
 const BUFFER_SIZE: usize = 256 * 1024;
@@ -55,6 +81,8 @@ const DISCO_MAGIC: &[u8] = b"TS\xf0\x9f\x92\xac";
 #[derive(Default, Clone)]
 pub struct ServerConfig {
     pub key: Option<PrivateKey>,
+    pub preshared_key: Option<[u8; 32]>,
+    pub disable_preshared_key: bool,
     pub region: Option<Region>,
     pub region_id: i64,
     pub derp_map_url: Option<String>,
@@ -62,6 +90,10 @@ pub struct ServerConfig {
     pub on_tcp: Option<PortHandler>,
     pub on_tcp_forward: Option<ForwardHandler>,
     pub served_tcp_ports: Option<Vec<(u16, u16)>>,
+    pub on_udp: Option<UdpPortHandler>,
+    pub on_udp_forward: Option<UdpForwardHandler>,
+    pub served_udp_ports: Option<Vec<(u16, u16)>>,
+    pub udp_idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +166,19 @@ pub struct Server {
 impl Server {
     pub async fn start(mut config: ServerConfig) -> Result<Self> {
         let key = config.key.clone().unwrap_or_default();
+        let psk = if config.disable_preshared_key {
+            None
+        } else {
+            Some(
+                config
+                    .preshared_key
+                    .filter(|k| *k != [0; 32])
+                    .unwrap_or_else(rand::random),
+            )
+        };
+        config.preshared_key = psk;
         let mut info = ConnInfo {
+            preshared_key: psk,
             server_public: key.public(),
             server_disco_public: Some(key.disco_public()),
             region: config.region.clone().into_iter().collect(),
@@ -153,6 +197,24 @@ impl Server {
         config.region = Some(region.clone());
         let handle = Actor::start(key, region, Some(config), None).await?;
         Ok(Self { handle, info })
+    }
+    pub async fn listen(&self, network: &str, port: u16) -> Result<Listener> {
+        let udp = match network {
+            "tcp" => false,
+            "udp" => true,
+            _ => bail!("network must be tcp or udp"),
+        };
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Listen {
+                udp,
+                port,
+                result: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("server is closed"))?;
+        rx.await?
     }
     pub fn tailcat_addr(&self) -> String {
         self.info.addr().expect("server connection info is valid")
@@ -246,6 +308,25 @@ impl Client {
             .await
             .context("ping timed out")??
     }
+    pub async fn dial_udp_port(&self, port: u16) -> Result<DatagramStream> {
+        self.dial_udp(SocketAddr::new(self.server_addr.into(), port))
+            .await
+    }
+    pub async fn dial_udp(&self, target: SocketAddr) -> Result<DatagramStream> {
+        if target.port() == 0 {
+            bail!("UDP port must be nonzero");
+        }
+        let (tx, rx) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::DialUdp {
+                target: to_ipv6(target),
+                result: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("client is closed"))?;
+        rx.await?
+    }
     pub async fn dial_tcp_port(&self, port: u16) -> Result<DuplexStream> {
         self.dial_tcp(SocketAddr::new(self.server_addr.into(), port))
             .await
@@ -297,6 +378,21 @@ fn from_ipv6(addr: SocketAddr) -> SocketAddr {
 }
 
 enum Command {
+    Listen {
+        udp: bool,
+        port: u16,
+        result: oneshot::Sender<Result<Listener>>,
+    },
+    DialUdp {
+        target: SocketAddr,
+        result: oneshot::Sender<Result<DatagramStream>>,
+    },
+    SendUdp {
+        flow: (SocketAddr, SocketAddr),
+        bytes: Vec<u8>,
+        generation: CancellationToken,
+        result: oneshot::Sender<()>,
+    },
     Status(oneshot::Sender<RuntimeStatus>),
     Dial {
         target: SocketAddr,
@@ -343,12 +439,16 @@ struct Actor {
     region: Region,
     config: Option<ServerConfig>,
     server: Option<[u8; 32]>,
+    preshared_key: Option<[u8; 32]>,
     peers: HashMap<[u8; 32], Peer>,
     device: PacketDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
     links: Vec<Link>,
     commands: mpsc::Receiver<Command>,
+    command_tx: mpsc::Sender<Command>,
+    udp_flows: HashMap<(SocketAddr, SocketAddr), datagram::UdpFlow>,
+    listeners: HashMap<(bool, u16), mpsc::Sender<AcceptedConnection>>,
     cancel: CancellationToken,
     relay: derp::DerpConnection,
     udp: Arc<UdpSocket>,
@@ -427,14 +527,21 @@ impl Actor {
             key,
             local,
             region,
-            config,
+            config: config.clone(),
             server: server.as_ref().map(|s| s.server_public),
+            preshared_key: config
+                .as_ref()
+                .and_then(|c| c.preshared_key)
+                .or_else(|| server.as_ref().and_then(|s| s.preshared_key)),
             peers: HashMap::new(),
             device,
             iface,
             sockets: SocketSet::new(vec![]),
             links: vec![],
             commands,
+            command_tx: tx.clone(),
+            udp_flows: HashMap::new(),
+            listeners: HashMap::new(),
             cancel: cancel.clone(),
             relay,
             udp,
@@ -469,7 +576,14 @@ impl Actor {
             return;
         }
         let index = (self.peers.len() + 1) as u32;
-        let tunnel = Tunn::new(self.key.0.into(), key.into(), None, Some(25), index, None);
+        let tunnel = Tunn::new(
+            self.key.0.into(),
+            key.into(),
+            self.preshared_key,
+            Some(25),
+            index,
+            None,
+        );
         self.peers.insert(
             key,
             Peer {
@@ -507,6 +621,50 @@ impl Actor {
     }
     async fn command(&mut self, command: Command) {
         match command {
+            Command::Listen {
+                udp,
+                mut port,
+                result,
+            } => {
+                self.listeners.retain(|_, tx| !tx.is_closed());
+                if port == 0 {
+                    port = (49152..=65535)
+                        .find(|p| !self.listeners.contains_key(&(udp, *p)))
+                        .unwrap_or(0);
+                }
+                if port == 0 || self.listeners.contains_key(&(udp, port)) {
+                    let _ = result.send(Err(anyhow!("port is already in use")));
+                    return;
+                }
+                let (tx, incoming) = mpsc::channel(32);
+                self.listeners.insert((udp, port), tx);
+                let _ = result.send(Ok(Listener { port, incoming }));
+            }
+            Command::DialUdp { target, result } => {
+                if self.udp_flows.len() >= MAX_CONNECTIONS {
+                    let _ = result.send(Err(anyhow!("too many UDP flows")));
+                    return;
+                }
+                let Some(port) = (32768..=65535).find(|p| {
+                    !self
+                        .udp_flows
+                        .contains_key(&(SocketAddr::new(self.local.into(), *p), target))
+                }) else {
+                    let _ = result.send(Err(anyhow!("no UDP ports available")));
+                    return;
+                };
+                let stream = self.new_udp_flow((SocketAddr::new(self.local.into(), port), target));
+                let _ = result.send(Ok(stream));
+            }
+            Command::SendUdp {
+                flow,
+                bytes,
+                generation,
+                result,
+            } => {
+                self.udp_output(flow, &bytes, generation);
+                let _ = result.send(());
+            }
             Command::Status(result) => {
                 let _ = result.send(self.status());
             }
@@ -679,7 +837,7 @@ impl Actor {
         if !self.peers.contains_key(&key) {
             return;
         }
-        let mut buf = vec![0; 65536];
+        let mut buf = vec![0; 65536 + 128];
         let mut packet = data.as_slice();
         loop {
             let result = self.peers.get_mut(&key).unwrap().tunnel.decapsulate(
@@ -717,6 +875,10 @@ impl Actor {
         if ip.version() != 6 {
             return;
         }
+        if ip.next_header() == IpProtocol::Udp {
+            self.udp_input(&ip);
+            return;
+        }
         if let Some(config) = &self.config {
             let dest = ip.dst_addr();
             if ip.next_header() == IpProtocol::Tcp {
@@ -726,22 +888,34 @@ impl Actor {
                 // Parse with the same validation as the network stack before
                 // allocating buffers or invoking user-supplied port handlers.
                 // This checks lengths, flags, options, ports, and checksum.
-                let Ok(tcp) = TcpRepr::parse(
+                let parsed = TcpRepr::parse(
                     &tcp,
                     &ip.src_addr().into(),
                     &dest.into(),
                     &ChecksumCapabilities::default(),
-                ) else {
+                );
+                let Ok(tcp) = parsed else {
                     return;
                 };
                 let sport = tcp.src_port;
                 let port = tcp.dst_port;
                 if dest == self.local
+                    && !self
+                        .listeners
+                        .get(&(false, port))
+                        .is_some_and(|tx| !tx.is_closed())
                     && config
                         .served_tcp_ports
                         .as_ref()
                         .is_some_and(|ports| !ports.iter().any(|(a, b)| *a <= port && port <= *b))
                 {
+                    tracing::debug!(
+                        "Drop: TCP{{[{}]:{} > [{}]:{}}}",
+                        ip.src_addr(),
+                        sport,
+                        dest,
+                        port
+                    );
                     return;
                 }
                 if tcp.control == TcpControl::Syn && tcp.ack_number.is_none() {
@@ -751,7 +925,20 @@ impl Actor {
                     );
                     let duplicate = self.links.iter().any(|link| link.flow == flow);
                     if !duplicate && self.links.len() < MAX_CONNECTIONS {
-                        let handler = if dest == self.local {
+                        let listener = self
+                            .listeners
+                            .get(&(false, port))
+                            .filter(|tx| dest == self.local && !tx.is_closed())
+                            .cloned();
+                        let handler = if let Some(tx) = listener {
+                            Some(Arc::new(move |stream| {
+                                let tx = tx.clone();
+                                Box::pin(async move {
+                                    let _ = tx.try_send(AcceptedConnection::Tcp(stream));
+                                })
+                                    as Pin<Box<dyn Future<Output = ()> + Send>>
+                            }) as TcpHandler)
+                        } else if dest == self.local {
                             config.on_tcp.as_ref().and_then(|f| f(port))
                         } else {
                             config
@@ -797,6 +984,7 @@ impl Actor {
         let _ = self.relay.outgoing.try_send((key, packet));
     }
     async fn tick(&mut self) {
+        self.expire_udp();
         let now = SmolInstant::from_millis(self.start.elapsed().as_millis() as i64);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.poll_links();
@@ -813,7 +1001,7 @@ impl Actor {
                     .copied()
             });
             if let Some(key) = key {
-                let mut buf = vec![0; 65536];
+                let mut buf = vec![0; 65536 + 128];
                 if let TunnResult::WriteToNetwork(b) = self
                     .peers
                     .get_mut(&key)
@@ -828,7 +1016,7 @@ impl Actor {
         if self.last_timers.elapsed() >= Duration::from_millis(250) {
             self.last_timers = Instant::now();
             for key in self.peers.keys().copied().collect::<Vec<_>>() {
-                let mut buf = vec![0; 65536];
+                let mut buf = vec![0; 65536 + 128];
                 if let TunnResult::WriteToNetwork(b) = self
                     .peers
                     .get_mut(&key)
@@ -887,7 +1075,21 @@ impl Actor {
                         socket.abort();
                     }
                 } else if let Some(handler) = link.handler.take() {
-                    tokio::spawn(handler(app));
+                    let peer_key = self
+                        .peers
+                        .keys()
+                        .find(|key| {
+                            smoltcp::wire::IpAddress::from(protocol::tc_addr_for_key(key))
+                                == link.flow.1.addr
+                        })
+                        .copied()
+                        .unwrap_or_default();
+                    let context = ConnectionInfo {
+                        peer_key,
+                        local_addr: SocketAddr::new(link.flow.0.addr.into(), link.flow.0.port),
+                        remote_addr: SocketAddr::new(link.flow.1.addr.into(), link.flow.1.port),
+                    };
+                    tokio::spawn(CONNECTION_INFO.scope(context, handler(app)));
                 }
             }
             if link.connected.as_ref().is_some_and(|r| r.is_closed()) {
@@ -1204,6 +1406,7 @@ fn new_socket() -> tcp::Socket<'static> {
         tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
         tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
     );
+    socket.set_congestion_control(tcp::CongestionControl::Cubic);
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
     socket.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));

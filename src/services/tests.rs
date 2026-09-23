@@ -581,3 +581,45 @@ fn host_key_persists_with_restrictive_permissions() {
         );
     }
 }
+
+#[tokio::test]
+async fn ssh_public_key_authentication_rejects_strangers() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = Arc::new(
+        russh::keys::PrivateKey::random(&mut rand10::rng(), russh::keys::Algorithm::Ed25519)
+            .unwrap(),
+    );
+    let mut config = SshConfig::with_key_path(true, None, &dir.path().join("host")).unwrap();
+    config.authorized_keys = Some(vec![key.public_key().clone()]);
+    let (client, server) = tokio::io::duplex(1024 * 1024);
+    tokio::spawn(serve_ssh(server, Arc::new(config)));
+    let mut client = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client,
+        TunnelClient,
+    )
+    .await
+    .unwrap();
+    assert!(!client.authenticate_none("user").await.unwrap().success());
+    let stranger = Arc::new(
+        russh::keys::PrivateKey::random(&mut rand10::rng(), russh::keys::Algorithm::Ed25519)
+            .unwrap(),
+    );
+    assert!(
+        !client
+            .authenticate_publickey(
+                "user",
+                russh::keys::PrivateKeyWithHashAlg::new(stranger, None)
+            )
+            .await
+            .unwrap()
+            .success()
+    );
+    assert!(
+        client
+            .authenticate_publickey("user", russh::keys::PrivateKeyWithHashAlg::new(key, None))
+            .await
+            .unwrap()
+            .success()
+    );
+}

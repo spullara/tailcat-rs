@@ -24,6 +24,8 @@ pub async fn run(args: &Args) -> Result<()> {
         "cp" => clients::cp(args).await,
         "ls" => clients::ls(args).await,
         "forward" => clients::forward(args).await,
+        "browse" => clients::browse(args).await,
+        "perf" => clients::perf(args).await,
         "genkey" => keys::genkey(args).await,
         "parse" => {
             if args.positional.len() != 1 {
@@ -74,6 +76,26 @@ pub async fn run(args: &Args) -> Result<()> {
 pub async fn main() -> i32 {
     crate::protocol::enable_disk_derp_cache();
     let input = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "android")]
+    let input = {
+        let mut input = input;
+        let exe = std::env::current_exe().ok();
+        let termux = std::env::var_os("TERMUX_VERSION").is_some()
+            || exe
+                .as_ref()
+                .is_some_and(|p| p.starts_with("/data/data/com.termux/files/"));
+        if termux
+            && input.first().is_some_and(|arg| {
+                let p = std::path::Path::new(arg);
+                p.is_absolute()
+                    && p.is_file()
+                    && exe.as_ref().is_some_and(|e| e.file_name() == p.file_name())
+            })
+        {
+            input.remove(0);
+        }
+        input
+    };
     let args = match Args::parse(input.clone()) {
         Ok(args) => args,
         Err(err) => {

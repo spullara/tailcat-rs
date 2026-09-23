@@ -1,0 +1,600 @@
+diff --git a/cmd/tailcat/e2e_test.go b/cmd/tailcat/e2e_test.go
+index 73d52f505..19424677a 100644
+--- a/cmd/tailcat/e2e_test.go
++++ b/cmd/tailcat/e2e_test.go
+@@ -44,6 +44,25 @@
+ // tests fail; later tests get it hardlinked or copied into their own
+ // TempDirs via integration.BinaryInfo.CopyTo.
+ func buildTailcat(t *testing.T) string {
++	t.Helper()
++	// Run the unchanged behavioral suite against another implementation.
++	// This override is deliberately opt-in; ordinary Go tests still build Go.
++	if bin := os.Getenv("TAILCAT_TEST_BINARY"); bin != "" {
++		abs, err := filepath.Abs(bin)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := os.Stat(abs); err != nil {
++			t.Fatal(err)
++		}
++		return abs
++	}
++	return buildGoTailcat(t)
++}
++
++// buildGoTailcat always builds the independent Go reference, even when the
++// behavioral suite is configured to launch the Rust executable.
++func buildGoTailcat(t *testing.T) string {
+ 	t.Helper()
+ 	dir := t.TempDir()
+ 	buildOnce.Do(func() { buildErr = buildTailcatBinary(dir) })
+diff --git a/cmd/tailcat/rust_binary_interop_test.go b/cmd/tailcat/rust_binary_interop_test.go
+new file mode 100644
+index 000000000..8c8f0c925
+--- /dev/null
++++ b/cmd/tailcat/rust_binary_interop_test.go
+@@ -0,0 +1,227 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package main
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/tailscale/tailcat"
++)
++
++// TestRustInteropBinaries launches the actual Go and Rust executables. It
++// complements TestRustInterop's Go-library oracle with the complete CLI paths.
++func TestRustInteropBinaries(t *testing.T) {
++	if os.Getenv("TAILCAT_TEST_BINARY") == "" {
++		t.Skip("requires Rust binary override")
++	}
++	e := newTestEnv(t)
++	goBin := buildGoTailcat(t) // Deliberately bypass TAILCAT_TEST_BINARY.
++	for _, pair := range []struct {
++		name, client, server string
++	}{
++		{"RustClientGoServer", e.bin, goBin},
++		{"GoClientRustServer", goBin, e.bin},
++	} {
++		t.Run(pair.name, func(t *testing.T) {
++			command := func(bin string, relayOnly bool, args ...string) *exec.Cmd {
++				cmd := exec.Command(bin, append([]string{"--key=new", "--derpmap-url=" + e.derpMapURL}, args...)...)
++				cmd.Env = append(append([]string{}, e.env...),
++					"TS_DEBUG_TAILCAT_LOCAL_DERP=0",
++					"TS_DEBUG_ALWAYS_USE_DERP=0",
++					"TS_DEBUG_NEVER_DIRECT_UDP=0")
++				if relayOnly && bin == goBin {
++					// This upstream knob prevents Go from opening either UDP socket,
++					// making a successful exchange proof of relay-only transport.
++					cmd.Env = append(cmd.Env, "TS_DEBUG_ALWAYS_USE_DERP=1")
++				}
++				return cmd
++			}
++			for _, relayOnly := range []bool{false, true} {
++				name := "AutoPipe"
++				if relayOnly {
++					name = "RelayOnlyPipe"
++				}
++				t.Run(name, func(t *testing.T) {
++					request, response := interopPayload(0x35), interopPayload(0xa7)
++					port, exchange := startInteropExchange(t, request, response)
++					addrFile := filepath.Join(t.TempDir(), "addr")
++					serverCmd := command(pair.server, relayOnly, "serve", strconv.Itoa(int(port)))
++					serverCmd.Env = append(serverCmd.Env, "TAILCAT_ADDR_FILE="+addrFile)
++					server := startInteropProcess(t, serverCmd)
++					addr := server.address(t, addrFile)
++					clientCmd := command(pair.client, relayOnly, addr, strconv.Itoa(int(port)))
++					clientCmd.Stdin = bytes.NewReader(request)
++					client := startInteropProcess(t, clientCmd)
++					client.wait(t)
++					if err := <-exchange; err != nil {
++						t.Fatalf("application exchange: %v\nserver stderr:\n%s", err, server.stderr())
++					}
++					if !bytes.Equal(client.stdout.Bytes(), response) {
++						t.Fatalf("client received %d bytes; want %d exact bytes\nclient stderr:\n%s\nserver stderr:\n%s",
++							client.stdout.Len(), len(response), client.stderr(), server.stderr())
++					}
++					t.Logf("verified %d request bytes and %d response bytes; response completed after request EOF", len(request), len(response))
++				})
++			}
++			t.Run("DirectDiscovery", func(t *testing.T) {
++				addrFile := filepath.Join(t.TempDir(), "addr")
++				serverCmd := command(pair.server, false)
++				serverCmd.Env = append(serverCmd.Env, "TAILCAT_ADDR_FILE="+addrFile)
++				server := startInteropProcess(t, serverCmd)
++				addr := server.address(t, addrFile)
++				client := startInteropProcess(t, command(pair.client, false, "ping", "--until-direct", "--timeout=20s", addr))
++				client.wait(t)
++				lines := strings.Split(strings.TrimSpace(client.stdout.String()), "\n")
++				last := lines[len(lines)-1]
++				_, endpoint, ok := strings.Cut(last, " via ")
++				if !strings.HasPrefix(last, "pong in ") || !ok {
++					t.Fatalf("missing direct pong: %q", client.stdout.String())
++				}
++				if _, err := netip.ParseAddrPort(endpoint); err != nil {
++					t.Fatalf("pong did not use a direct UDP endpoint: %q", last)
++				}
++				t.Log(last)
++			})
++		})
++	}
++}
++
++func interopPayload(seed byte) []byte {
++	b := make([]byte, 2<<20)
++	for i := range b {
++		b[i] = byte(i*37+i/256) ^ seed
++	}
++	return b
++}
++
++// Send an initial reply before consuming the request, then wait for request
++// EOF before sending the remainder. This exercises bidirectional transfer and
++// preserves the client's ability to receive after closing its write half.
++func startInteropExchange(t *testing.T, request, response []byte) (uint16, <-chan error) {
++	t.Helper()
++	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
++	t.Cleanup(func() { cancel(); ln.Close() })
++	deadline, _ := ctx.Deadline()
++	if err := ln.SetDeadline(deadline); err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() {
++		done <- func() error {
++			conn, err := ln.AcceptTCP()
++			if err != nil {
++				return err
++			}
++			defer conn.Close()
++			stop := context.AfterFunc(ctx, func() { conn.Close() })
++			defer stop()
++			if err := conn.SetDeadline(deadline); err != nil {
++				return err
++			}
++			const prefix = 64 << 10
++			if _, err := conn.Write(response[:prefix]); err != nil {
++				return err
++			}
++			got, err := io.ReadAll(conn)
++			if err != nil {
++				return err
++			}
++			if !bytes.Equal(got, request) {
++				return fmt.Errorf("application received %d bytes; want %d exact bytes", len(got), len(request))
++			}
++			if _, err := conn.Write(response[prefix:]); err != nil {
++				return err
++			}
++			return conn.CloseWrite()
++		}()
++	}()
++	return uint16(ln.Addr().(*net.TCPAddr).Port), done
++}
++
++// File-backed stderr can safely be inspected while a process is still running.
++// stdout is read only after Wait completes, and every child is killed/reaped on
++// timeout or test failure, including long-running serve commands.
++type interopProcess struct {
++	done       chan struct{}
++	err        error
++	stdout     bytes.Buffer
++	stderrPath string
++}
++
++func startInteropProcess(t *testing.T, command *exec.Cmd) *interopProcess {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
++	p := &interopProcess{done: make(chan struct{}), stderrPath: filepath.Join(t.TempDir(), "stderr")}
++	stderr, err := os.Create(p.stderrPath)
++	if err != nil {
++		cancel()
++		t.Fatal(err)
++	}
++	cmd := exec.CommandContext(ctx, command.Path, command.Args[1:]...)
++	cmd.Env, cmd.Dir, cmd.Stdin = command.Env, command.Dir, command.Stdin
++	cmd.Stdout, cmd.Stderr, cmd.WaitDelay = &p.stdout, stderr, 2*time.Second
++	if err := cmd.Start(); err != nil {
++		cancel()
++		stderr.Close()
++		t.Fatal(err)
++	}
++	go func() { p.err = cmd.Wait(); close(p.done) }()
++	t.Cleanup(func() {
++		cancel()
++		<-p.done
++		stderr.Close()
++		if t.Failed() {
++			t.Logf("%s stderr:\n%s", cmd.Path, p.stderr())
++		}
++	})
++	return p
++}
++
++func (p *interopProcess) stderr() string {
++	b, _ := os.ReadFile(p.stderrPath)
++	return string(b)
++}
++
++func (p *interopProcess) wait(t *testing.T) {
++	t.Helper()
++	<-p.done
++	if p.err != nil {
++		t.Fatalf("tailcat exited with %v\nstderr:\n%s", p.err, p.stderr())
++	}
++}
++
++func (p *interopProcess) address(t *testing.T, path string) string {
++	t.Helper()
++	ticker := time.NewTicker(20 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
++			addr := strings.TrimSpace(string(b))
++			if _, err := tailcat.ParseAddr(tailcat.Addr(addr)); err == nil {
++				return addr
++			}
++		}
++		select {
++		case <-p.done:
++			t.Fatalf("server exited before publishing address: %v\nstderr:\n%s", p.err, p.stderr())
++		case <-ticker.C:
++		}
++	}
++}
+diff --git a/cmd/tailcat/rust_interop_test.go b/cmd/tailcat/rust_interop_test.go
+new file mode 100644
+index 000000000..b5eedd75e
+--- /dev/null
++++ b/cmd/tailcat/rust_interop_test.go
+@@ -0,0 +1,116 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package main
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net"
++	"os"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/tailscale/tailcat"
++)
++
++// These tests intentionally keep the Go implementation as an independent
++// protocol oracle. Enable them with TAILCAT_TEST_BINARY=/absolute/rust/tailcat.
++func TestRustInterop(t *testing.T) {
++	if os.Getenv("TAILCAT_TEST_BINARY") == "" {
++		t.Skip("requires Rust binary override")
++	}
++	e := newTestEnv(t)
++	dm, err := tailcat.FetchDERPMap(t.Context(), tailcat.DERPMapURL(e.derpMapURL))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var reg = dm.Regions[1]
++	if reg == nil {
++		t.Fatal("missing local region")
++	}
++	t.Run("RustClientGoServer", func(t *testing.T) {
++		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
++		defer cancel()
++		deadline, _ := ctx.Deadline()
++		serverDone := make(chan error, 1)
++		s := &tailcat.Server{Region: reg, Logf: t.Logf}
++		s.OnTCP = func(port uint16) func(net.Conn) {
++			return func(c net.Conn) {
++				defer c.Close()
++				if err := c.SetDeadline(deadline); err != nil {
++					serverDone <- err
++					return
++				}
++				// Respond only after EOF: catches premature full-close instead of FIN.
++				data, err := io.ReadAll(c)
++				if err == nil {
++					_, err = c.Write(data)
++				}
++				serverDone <- err
++			}
++		}
++		if err := s.Start(); err != nil {
++			t.Fatal(err)
++		}
++		defer s.Close()
++		payload := strings.Repeat("WireGuard Go to Rust half-close\x00\xff", 65536)
++		got, err := runClient(t, e.cmd("--key=new", string(s.TailcatAddr())), nil, payload)
++		if err != nil {
++			t.Fatal(err)
++		}
++		select {
++		case err := <-serverDone:
++			if err != nil {
++				t.Fatalf("Go server transfer: %v", err)
++			}
++		case <-ctx.Done():
++			t.Fatalf("Go server transfer did not finish: %v", ctx.Err())
++		}
++		if got != payload {
++			t.Fatalf("round-trip mismatch: received %d of %d bytes", len(got), len(payload))
++		}
++	})
++	t.Run("GoClientRustServer", func(t *testing.T) {
++		port := startEchoListener(t)
++		_, addr, stderr := e.startServer("serve", strconv.Itoa(int(port)))
++		c := &tailcat.Client{Server: tailcat.Addr(addr), DERPMapURL: e.derpMapURL, Logf: t.Logf}
++		defer c.Close()
++		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
++		defer cancel()
++		conn, err := c.DialTCPPort(ctx, port)
++		if err != nil {
++			t.Fatalf("dial: %v\n%s", err, stderr.String())
++		}
++		defer conn.Close()
++		deadline, _ := ctx.Deadline()
++		if err := conn.SetDeadline(deadline); err != nil {
++			t.Fatal(err)
++		}
++		payload := bytes.Repeat([]byte("Rust server interoperability\x00\xff"), 65536)
++		writeDone := make(chan error, 1)
++		go func() {
++			_, err := conn.Write(payload)
++			if err == nil {
++				err = conn.(interface{ CloseWrite() error }).CloseWrite()
++			}
++			writeDone <- err
++		}()
++		got, err := io.ReadAll(conn)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := <-writeDone; err != nil {
++			t.Fatal(err)
++		}
++		if !bytes.Equal(got, payload) {
++			t.Fatalf("round-trip mismatch: received %d of %d bytes", len(got), len(payload))
++		}
++		if err := c.DrainTCP(ctx); err != nil {
++			t.Fatal(err)
++		}
++	})
++}
+diff --git a/cmd/tailcat/rust_perf_interop_test.go b/cmd/tailcat/rust_perf_interop_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/tailcat/rust_perf_interop_test.go
+@@ -0,0 +1,48 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++package main
++
++import (
++ "context"
++ "encoding/json"
++ "net"
++ "os"
++ "testing"
++ "time"
++ "github.com/tailscale/tailcat"
++ "github.com/tailscale/tailcat/internal/perf"
++)
++
++func TestRustInteropPerf(t *testing.T) {
++ if os.Getenv("TAILCAT_TEST_BINARY") == "" { t.Skip("requires Rust binary override") }
++ e := newTestEnv(t)
++ dm, err := tailcat.FetchDERPMap(t.Context(), tailcat.DERPMapURL(e.derpMapURL)); if err != nil { t.Fatal(err) }
++ t.Run("GoClientRustServer",func(t *testing.T) {
++  _,addr,_ := e.startServer("serve","perf")
++  client := &tailcat.Client{Server:tailcat.Addr(addr),DERPMapURL:e.derpMapURL}; defer client.Close()
++  pc := &perf.Client{DialTCP:func(ctx context.Context)(net.Conn,error){return client.DialTCPPort(ctx,perf.Port)},DialUDP:func(ctx context.Context)(net.Conn,error){return client.DialUDPPort(ctx,perf.Port)}}
++  for _,proto := range []perf.Proto{perf.TCP,perf.UDP} { for _,dir := range []perf.Direction{perf.Upload,perf.Download,perf.Bidirectional} {
++   t.Run(string(proto)+"/"+string(dir),func(t *testing.T){ ctx,cancel:=context.WithTimeout(t.Context(),30*time.Second); defer cancel()
++    res,err:=pc.Run(ctx,perf.Params{Proto:proto,Direction:dir,Bytes:12000,Streams:2,Length:1200,Bitrate:1000000}); if err!=nil {t.Fatal(err)}
++    if dir!=perf.Download && (res.ClientSent.Bytes!=24000 || res.ServerReceived.Bytes!=24000) {t.Fatalf("upload mismatch: %+v",res)}
++    if dir!=perf.Upload && (res.ServerSent.Bytes!=24000 || res.ClientReceived.Bytes!=24000) {t.Fatalf("download mismatch: %+v",res)}
++    time.Sleep(50*time.Millisecond)
++   })
++  } }
++ })
++ t.Run("RustClientGoServer",func(t *testing.T) {
++  ps:=new(perf.Server)
++  server:=&tailcat.Server{Region:dm.Regions[1]}; defer server.Close()
++  server.OnTCP=func(port uint16)func(net.Conn){if port==perf.Port{return ps.HandleTCP};return nil}
++  server.OnUDP=func(port uint16)func(tailcat.ConnPacketConn){if port==perf.Port{return func(c tailcat.ConnPacketConn){ps.HandleUDP(c)}};return nil}
++  if err:=server.Start();err!=nil{t.Fatal(err)}
++  for _,proto:=range []string{"tcp","udp"}{for _,dir:=range []string{"up","down","both"}{t.Run(proto+"/"+dir,func(t *testing.T){
++   args:=[]string{"--key=new","--derpmap-url="+e.derpMapURL,"--json","perf","--bytes=12000","--parallel=2","--length=1200","--bitrate=1M","--interval=0","--via-derp"}
++   if proto=="udp"{args=append(args,"--udp")};if dir=="down"{args=append(args,"--reverse")};if dir=="both"{args=append(args,"--bidir")};args=append(args,string(server.TailcatAddr()))
++   cmd:=e.cmd(args...); out,err:=cmd.Output();if err!=nil{t.Fatalf("client: %v",err)}
++   var res perf.Result;if err:=json.Unmarshal(out,&res);err!=nil{t.Fatalf("%v: %s",err,out)}
++   if dir!="down" && (res.ClientSent==nil || res.ServerReceived==nil || res.ClientSent.Bytes!=24000 || res.ServerReceived.Bytes!=24000){t.Fatalf("upload mismatch: %s",out)}
++   if dir!="up" && (res.ServerSent==nil || res.ClientReceived==nil || res.ServerSent.Bytes!=24000 || res.ClientReceived.Bytes!=24000){t.Fatalf("download mismatch: %s",out)}
++  })}}
++ })
++}
+diff --git a/web/wasm_test.go b/web/wasm_test.go
+index bbf7fdb04..bce6ffd7f 100644
+--- a/web/wasm_test.go
++++ b/web/wasm_test.go
+@@ -103,6 +103,9 @@ func findChromium() string {
+ // buildDist builds the web app's dist directory once per test
+ // process and returns its path.
+ var buildDist = sync.OnceValues(func() (string, error) {
++	if dir := os.Getenv("TAILCAT_WEB_DIST"); dir != "" {
++		return dir, nil
++	}
+ 	dir, err := os.MkdirTemp("", "tailcat-wasm-test")
+ 	if err != nil {
+ 		return "", err
+@@ -149,9 +152,16 @@ func newWebServer(t *testing.T, dm *tailcfg.DERPMap) *httptest.Server {
+ 	if err != nil {
+ 		t.Fatalf("building dist: %v", err)
+ 	}
+-	app, err := webdemo.Handler(os.DirFS(distDir))
+-	if err != nil {
+-		t.Fatal(err)
++	var app http.Handler
++	if os.Getenv("TAILCAT_WEB_DIST") != "" {
++		// The Rust distribution has wasm-bindgen's tailcat.js and no Go
++		// wasm_exec.js. Keep the original Go distribution path as an oracle.
++		app = http.FileServer(http.Dir(distDir))
++	} else {
++		app, err = webdemo.Handler(os.DirFS(distDir))
++		if err != nil {
++			t.Fatal(err)
++		}
+ 	}
+ 	mux := http.NewServeMux()
+ 	mux.Handle("/", app)
+@@ -366,7 +376,7 @@ type recvResult struct {
+ 	var sendDone bool
+ 	if err := chromedp.Run(runCtx,
+ 		chromedp.Navigate(pageURL),
+-		chromedp.Poll("window.tcTest.sendDone === true", &sendDone,
++		chromedp.Poll("window.tcTest && window.tcTest.sendDone === true", &sendDone,
+ 			chromedp.WithPollingTimeout(90*time.Second)),
+ 	); err != nil {
+ 		t.Fatalf("chromedp run: %v", err)
+@@ -442,7 +452,7 @@ func TestBrowserSendsTextUI(t *testing.T) {
+ 		chromedp.SetValue("#send-addr", string(addr)),
+ 		chromedp.SetValue("#send-text", wantText),
+ 		chromedp.Click("#send-text-btn"),
+-		chromedp.Poll("window.tcTest.sendDone === true", &sendDone,
++		chromedp.Poll("window.tcTest && window.tcTest.sendDone === true", &sendDone,
+ 			chromedp.WithPollingTimeout(90*time.Second)),
+ 	); err != nil {
+ 		t.Fatalf("chromedp run: %v", err)
+@@ -541,3 +551,109 @@ func TestBrowserReceivesTextUI(t *testing.T) {
+ 	}
+ 	checkPageErrors(t, runCtx)
+ }
++
++// Retained JavaScript connection objects must not acquire a later connection
++// when the userspace stack recycles a socket slot. Closing a listener while its
++// relay reconnects must also close the newly opened WebSocket.
++func TestBrowserClosedConnectionIsolation(t *testing.T) {
++	bin := preflight(t)
++	if os.Getenv("TAILCAT_WEB_DIST") == "" {
++		t.Skip("Rust browser runtime regression; set TAILCAT_WEB_DIST")
++	}
++	dm := integration.RunDERPAndSTUN(t, mkLogf(t, "derpstun"), "127.0.0.1")
++	srv := newWebServer(t, dm)
++	runCtx, cancel := context.WithTimeout(launchChrome(t, bin), 60*time.Second)
++	defer cancel()
++	var ready bool
++	var addr string
++	if err := chromedp.Run(runCtx,
++		chromedp.Navigate(srv.URL),
++		chromedp.Poll("window.tcTest && window.tcTest.ready", &ready),
++		chromedp.Evaluate(`
++		window.staleTest = {connections: [], websockets: [], addr: null, firstDone: false, staleDone: false, secondDone: false, closeOnReconnect: false};
++		const NativeWebSocket = globalThis.WebSocket;
++		globalThis.WebSocket = class extends NativeWebSocket {
++		  constructor(...args) {
++		    super(...args);
++		    staleTest.websockets.push(this);
++		    if (staleTest.closeOnReconnect) queueMicrotask(() => staleTest.listener.close());
++		  }
++		};
++		tailcatListen({derpMapURL: new URL('/derpmap.json', location.href).href,
++		  onConnection(conn) {
++		    staleTest.connections.push(conn);
++		    if (staleTest.connections.length === 1) (async () => {
++		      while ((await conn.read()) !== null) {}
++		      conn.close();
++		      staleTest.firstDone = true;
++		    })().catch(e => tcTest.errors.push(String(e)));
++		  }
++		}).then(listener => { staleTest.listener = listener; staleTest.addr = listener.addr; })
++		  .catch(e => tcTest.errors.push(String(e)));`, nil),
++		chromedp.Poll("window.staleTest.addr !== null", &ready),
++		chromedp.Evaluate("window.staleTest.addr", &addr),
++	); err != nil {
++		t.Fatal(err)
++	}
++	client := &tailcat.Client{Server: tailcat.Addr(addr), DERPMapURL: srv.URL + "/derpmap.json", Logf: mkLogf(t, "client")}
++	defer client.Close()
++	first, err := client.DialTCPPort(runCtx, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer first.Close()
++	first.SetDeadline(time.Now().Add(10 * time.Second))
++	io.WriteString(first, "first")
++	first.(interface{ CloseWrite() error }).CloseWrite()
++	if _, err := io.Copy(io.Discard, first); err != nil {
++		t.Fatal(err)
++	}
++	if err := client.DrainTCP(runCtx); err != nil {
++		t.Fatal(err)
++	}
++	second, err := client.DialTCPPort(runCtx, 1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer second.Close()
++	second.SetDeadline(time.Now().Add(10 * time.Second))
++	if _, err := io.WriteString(second, "second"); err != nil {
++		t.Fatal(err)
++	}
++	if err := chromedp.Run(runCtx,
++		chromedp.Poll("staleTest.connections.length === 2", &ready),
++		chromedp.Evaluate(`(async () => {
++		  const old = staleTest.connections[0];
++		  old.close();
++		  await old.closeWrite();
++		  if (await old.read() !== null) throw new Error('old connection read the new stream');
++		  let rejected = false;
++		  try { await old.write(Uint8Array.of(1)); } catch (_) { rejected = true; }
++		  if (!rejected) throw new Error('old connection wrote to the new stream');
++		  staleTest.staleDone = true;
++		  const conn = staleTest.connections[1];
++		  let text = '';
++		  for (let chunk; (chunk = await conn.read()) !== null;) text += new TextDecoder().decode(chunk);
++		  if (text !== 'second') throw new Error('new stream was corrupted: ' + text);
++		  conn.close();
++		  staleTest.secondDone = true;
++		})().catch(e => tcTest.errors.push(String(e)));`, nil),
++		chromedp.Poll("staleTest.staleDone || tcTest.errors.length > 0", &ready),
++	); err != nil {
++		t.Fatal(err)
++	}
++	checkPageErrors(t, runCtx)
++	second.(interface{ CloseWrite() error }).CloseWrite()
++	if _, err := io.Copy(io.Discard, second); err != nil {
++		t.Fatal(err)
++	}
++	if err := chromedp.Run(runCtx,
++		chromedp.Poll("staleTest.secondDone", &ready),
++		chromedp.Evaluate("staleTest.closeOnReconnect = true; staleTest.websockets[0].close();", nil),
++		chromedp.Poll("staleTest.websockets.length > 1 && staleTest.websockets.every(ws => ws.readyState === WebSocket.CLOSED)", &ready,
++			chromedp.WithPollingTimeout(15*time.Second)),
++	); err != nil {
++		t.Fatal(err)
++	}
++	checkPageErrors(t, runCtx)
++}

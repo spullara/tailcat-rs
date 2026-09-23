@@ -18,13 +18,16 @@ contacts do not replace reporting port-specific defects here.
 ## Threat model
 
 A Tailcat address contains the information needed to contact a service. Unless
-the server configures a client allowlist, possession of that address grants
-access. Treat addresses as secrets when offering private services. Publishing
+the server configures a client allowlist or SSH key authentication, possession
+of that address grants access. Treat addresses as secrets when offering private services. Publishing
 an address in DNS makes it public. Saved server identities preserve access
 across restarts, so previously shared addresses remain relevant.
 
 `no-auth-ssh` grants the current OS user's shell and, by default, filesystem
-access. It has no separate SSH user authentication. An exit node grants TCP
+access. It has no separate SSH user authentication. `ssh` can require an explicit SSH public-key allowlist; `exec` and forced SSH
+commands grant access to the selected program. New server addresses include a
+WireGuard PSK; old or explicitly PSK-free identities have no such extra key.
+An exit node grants TCP and UDP
 access through the server's network. Writable shares grant the specified file
 operations. Limit these capabilities to intended clients; use `--allow` with
 client identity keys or forward to an existing authenticated service where

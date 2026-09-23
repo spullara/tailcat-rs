@@ -19,7 +19,7 @@ This is an independent port, not a Tailscale-maintained release. It was extracte
 from the Rust port in
 [spullara/tailcat at `689b74e`](https://github.com/spullara/tailcat/tree/689b74e2405c18fbdf4b21a0610d8c1abae8f334),
 which used the original Go implementation as a compatibility reference.
-This checkout includes no Go source or Go repository history. See the
+The current compatibility baseline is [tailscale/tailcat at `83921d7`](https://github.com/tailscale/tailcat/tree/83921d7141b80db20fd733ee195c805d2721e489). The interoperability runner applies a test-only adapter patch to that pinned upstream checkout. This checkout includes no compiled Go code or Go repository history. See the
 [repository map](docs/repository-map.md) for architecture, protocol details,
 and validation provenance.
 
@@ -113,6 +113,8 @@ Expose local ports through the tunnel:
 
 ```sh
 tailcat serve 8080,8443
+# Expose tailcat port 80 through a different local or remote service:
+tailcat serve 80:8080 443:192.168.1.10:8443
 # Or serve every local TCP port:
 tailcat serve all
 ```
@@ -132,7 +134,9 @@ tailcat forward tcADDRESS 18080:8080 3306
 This binds `127.0.0.1:18080` to the server's port 8080 and
 `127.0.0.1:3306` to its port 3306. Local port `0` requests a free port; the
 listener prints the selected address. Use `--bind=0.0.0.0` before `tcADDRESS`
-to expose a listener to other machines. Ctrl-C stops forwarding.
+to expose a listener to other machines. Ctrl-C stops forwarding. `tailcat browse tcADDRESS` forwards remote port 80
+to a free local port and opens a browser. `forward --open-browser` does the same
+for one explicit mapping.
 
 ### Send and receive files
 
@@ -177,8 +181,8 @@ Transfers do not enable SSH compression.
 
 ### SSH
 
-The built-in SSH server runs as the current OS user and accepts no separate
-SSH password or user key:
+The built-in SSH server runs as the current OS user. The `no-auth-ssh` mode
+requires no separate SSH password or user key:
 
 ```sh
 tailcat serve no-auth-ssh
@@ -195,6 +199,38 @@ Use `serve --allow=... no-auth-ssh` to restrict access to client identities.
 A shell server also provides SFTP with the current user's filesystem access
 unless an explicit rooted file share is configured. To use your system SSH
 server and its authentication policies, run `tailcat serve 22` instead.
+
+To require SSH public-key authentication:
+
+```sh
+tailcat serve --ssh-authorized-keys=~/.ssh/authorized_keys ssh
+# Sources can also be literal public keys or user@github, separated by commas.
+```
+
+Authorized-key options are rejected because their restrictions are not implemented.
+DNS TXT records are public. Before SSH connects to a DNS name, it probes with a
+fresh tunnel identity and no SSH credentials, and refuses a server that accepts
+that stranger. `--skip-dns-safety-check` skips this probe.
+
+Run a fixed program for each connection with `tailcat serve exec -- program args`.
+With `ssh` or `no-auth-ssh`, a command after `--` becomes a forced command;
+client commands are ignored, and SFTP is disabled. The process receives
+`TAILCAT_PEER_KEY`, `TAILCAT_REMOTE_ADDR`, and `TAILCAT_LOCAL_ADDR`. Forced SSH
+commands also receive `SSH_ORIGINAL_COMMAND`.
+
+### Performance tests
+
+```sh
+tailcat serve perf
+tailcat perf tcADDRESS
+tailcat perf --udp --reverse --parallel=2 --time=10s tcADDRESS
+tailcat --json perf --bidir --bytes=10M tcADDRESS
+```
+
+Performance tests report both peers' byte counts and latency under load. UDP
+also reports datagrams, loss, reordering, and jitter. Tests require a direct path
+unless `--via-derp` permits a relay you operate. Shared Tailscale relays are
+always refused for relayed performance tests.
 
 ### Ping, SOCKS, and exit nodes
 
@@ -218,7 +254,9 @@ tailcat socks curl http://tcADDRESS:8080/
 
 Browsers lowercase hostnames, so use a local `forward` listener with them.
 
-An exit-node server allows TCP access to destinations reachable from its host:
+SOCKS5 supports UDP ASSOCIATE as well as TCP CONNECT.
+
+An exit-node server allows TCP and UDP access to destinations reachable from its host:
 
 ```sh
 tailcat serve exit-node
@@ -231,6 +269,11 @@ tailcat forward tcADDRESS 3001:172.23.52.30:3001
 ```
 
 ### Saved keys and access control
+
+New server addresses include a WireGuard pre-shared key (PSK).
+`serve --psk=false` and `genkey --psk=false` disable it. Saved keys remember
+their PSK choice; older saved keys remain usable without a PSK. An explicit
+`serve --psk=true` requires a PSK in the saved key.
 
 A server normally creates an ephemeral key. `genkey` saves an identity so the
 server address can remain stable across restarts:
@@ -330,6 +373,14 @@ are complete, compilable examples. After sending a request, call `shutdown()`
 on the stream's write side, continue reading the response, and call
 `drain_tcp()` before closing the client. This lets the userspace TCP stack
 finish FIN/ACK delivery.
+
+`Client::dial_udp_port` and `dial_udp` return bounded datagram flows. Each
+`recv()` returns one packet; `send()` sends one packet, including empty packets.
+`ServerConfig::on_udp` and `on_udp_forward` provide UDP handlers, with a default
+idle timeout of two minutes. A 1232-byte payload fits the tunnel MTU.
+`Server::listen("tcp", port)` and `listen("udp", port)` claim a port ahead of
+wildcard handlers; port zero selects a free dynamic port. Drop the listener to
+release its port. `accept()` returns `AcceptedConnection::Tcp` or `Udp`.
 
 `Client::status()` and `Server::status()` return peer keys and addresses,
 WireGuard handshake age and byte counters, fresh direct endpoints, and active

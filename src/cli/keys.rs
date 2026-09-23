@@ -161,7 +161,7 @@ pub async fn genkey(args: &Args) -> Result<()> {
         );
     }
     if args.client {
-        for flag in ["region", "fixed-region", "embed-derp-map"] {
+        for flag in ["region", "fixed-region", "embed-derp-map", "psk"] {
             if args.explicit.contains(flag) {
                 bail!("genkey --client does not take --{flag}; client keys have no DERP region");
             }
@@ -177,6 +177,11 @@ pub async fn genkey(args: &Args) -> Result<()> {
     }
     let private = PrivateKey::new();
     let mut public = ConnInfo {
+        preshared_key: if args.psk && !args.client {
+            Some(rand::random())
+        } else {
+            None
+        },
         server_public: private.public(),
         server_disco_public: Some(private.disco_public()),
         region: vec![],

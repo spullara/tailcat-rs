@@ -127,6 +127,23 @@ fn deserialize_disco_key<'de, D: Deserializer<'de>>(
         .map(|s| parse_hex_key(&s, "discokey:").map_err(serde::de::Error::custom))
         .transpose()
 }
+fn serialize_psk<S: Serializer>(
+    key: &Option<[u8; 32]>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match key {
+        Some(key) => s.serialize_str(&format!("psk:{}", hex::encode(key))),
+        None => s.serialize_none(),
+    }
+}
+fn deserialize_psk<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<[u8; 32]>, D::Error> {
+    Option::<String>::deserialize(d)?
+        .map(|s| parse_hex_key(&s, "psk:").map_err(serde::de::Error::custom))
+        .transpose()
+        .map(|key| key.filter(|k| *k != [0; 32]))
+}
 fn is_zero(v: &i64) -> bool {
     *v == 0
 }
@@ -145,6 +162,12 @@ pub struct ConnInfo {
         deserialize_with = "deserialize_disco_key"
     )]
     pub server_disco_public: Option<[u8; 32]>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_psk",
+        deserialize_with = "deserialize_psk"
+    )]
+    pub preshared_key: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub region: Vec<Region>,
     #[serde(rename = "RegionID", skip_serializing_if = "is_zero")]
@@ -224,6 +247,9 @@ pub fn encode_addr(ci: &ConnInfo) -> Result<String> {
     let mut fields = vec![field("p", Value::Bytes(ci.server_public.to_vec()))];
     if let Some(key) = ci.server_disco_public.filter(|k| *k != [0; 32]) {
         fields.push(field("k", Value::Bytes(key.to_vec())));
+    }
+    if let Some(key) = ci.preshared_key.filter(|k| *k != [0; 32]) {
+        fields.push(field("q", Value::Bytes(key.to_vec())));
     }
     if !ci.region.is_empty() {
         let regions = ci
@@ -343,6 +369,7 @@ pub fn parse_addr(addr: &str) -> Result<ConnInfo> {
     let mut ci = ConnInfo {
         server_public: read_key(fields, "p")?.unwrap_or_default(),
         server_disco_public: read_key(fields, "k")?,
+        preshared_key: read_key(fields, "q")?.filter(|k| *k != [0; 32]),
         region_id: read_int(fields, "i")?,
         region: Vec::new(),
     };
@@ -412,6 +439,12 @@ pub fn parse_addr_raw(addr: &str) -> Result<serde_json::Value> {
                 )
                 .into(),
             );
+            if let Some(k) = read_key(fields, "q")? {
+                out.insert(
+                    "PresharedKey".into(),
+                    format!("psk:{}", hex::encode(k)).into(),
+                );
+            }
             if let Some(k) = read_key(fields, "k")? {
                 out.insert(
                     "ServerDiscoPublic".into(),
@@ -838,7 +871,7 @@ pub async fn expand(ci: &mut ConnInfo, url: Option<&str>, is_server: bool) -> Re
         ci.region
             .push(dm.regions.remove(&ci.region_id).ok_or_else(|| {
                 anyhow!(
-                    "tailcat address specified DERP RegionID {} but no such region exists in {}",
+                    "no DERP region {} exists in {}",
                     ci.region_id,
                     url.unwrap_or(DEFAULT_DERP_MAP_URL)
                 )
@@ -850,6 +883,9 @@ pub async fn expand(ci: &mut ConnInfo, url: Option<&str>, is_server: bool) -> Re
 /// Probe relay STUN servers concurrently; no privileged/raw sockets are required.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn pick_best_region(dm: &DerpMap) -> Option<i64> {
+    if dm.regions.len() == 1 {
+        return dm.regions.keys().next().copied();
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for (id, region) in &dm.regions {
         for node in region.nodes.iter().filter(|n| n.stun_port >= 0).take(2) {
@@ -1014,6 +1050,26 @@ mod tests {
         assert_eq!(fallback.regions, first.regions);
         assert_eq!(requests.load(Ordering::SeqCst), 3);
         task.abort();
+    }
+
+    #[test]
+    fn preshared_key_roundtrips_and_rejects_bad_lengths() {
+        let ci = ConnInfo {
+            preshared_key: Some([42; 32]),
+            ..ConnInfo::for_key(&PrivateKey::new())
+        };
+        assert_eq!(parse_addr(&ci.addr().unwrap()).unwrap(), ci);
+        let json = serde_json::to_string(&ci).unwrap();
+        assert!(json.contains("psk:2a2a"));
+        assert_eq!(serde_json::from_str::<ConnInfo>(&json).unwrap(), ci);
+        assert!(serde_json::from_str::<ConnInfo>(r#"{"PresharedKey":"psk:00"}"#).is_err());
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(
+            &Value::Map(vec![field("q", Value::Bytes(vec![1; 31]))]),
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(parse_addr(&format!("tc{}", URL_SAFE_NO_PAD.encode(bytes))).is_err());
     }
 
     #[test]

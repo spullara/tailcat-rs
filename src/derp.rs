@@ -417,10 +417,9 @@ async fn relay_session(
                     5 => {
                         if body.len() < 32 || body.len() > 32 + MAX_PACKET { bail!("invalid DERP packet length"); }
                         let source = body[..32].try_into()?;
-                        match incoming.try_send((source, body[32..].to_vec())) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => (),
-                            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                        }
+                        // Backpressure the relay reader instead of discarding a burst
+                        // from a fast peer before the userspace TCP stack can consume it.
+                        if incoming.send((source, body[32..].to_vec())).await.is_err() { return Ok(()); }
                     }
                     0x12 if body.len() == 8 => write_frame(&mut writer, 0x13, &body).await?,
                     0x14 if !body.is_empty() => tracing::warn!(message = %String::from_utf8_lossy(&body), "DERP health"),
