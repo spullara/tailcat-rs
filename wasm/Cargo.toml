@@ -21,7 +21,7 @@ getrandom = { version = "0.2", features = ["js"] }
 gloo-net = { version = "0.6", default-features = false, features = ["http"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 js-sys = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
